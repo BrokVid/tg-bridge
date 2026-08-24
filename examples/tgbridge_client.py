@@ -119,7 +119,9 @@ class TgBridgeClient:
 
     def send_message(self, chat_id, text: str,
                      max_retries: int = 3, **extra) -> bool:
-        """Отправка с чанкингом длинных текстов и ретраями по retry_after."""
+        """Отправка с чанкингом длинных текстов и ретраями по retry_after.
+        Возвращает message_id последнего куска или None при неудаче."""
+        last_id = None
         for chunk in split_text(text):
             payload = {"chat_id": chat_id, "text": chunk, **extra}
             delivered = False
@@ -128,6 +130,7 @@ class TgBridgeClient:
                     r = self.call(os.environ.get("BOT_ALIAS", "salut"),
                                   "sendMessage", payload)
                     if r.get("ok"):
+                        last_id = r["result"]["message_id"]
                         delivered = True
                         break
                     params = (r.get("result") or {}).get("parameters") or {}
@@ -137,8 +140,20 @@ class TgBridgeClient:
                         break
                     time.sleep(min(2 ** attempt, 30))
             if not delivered:
-                return False
-        return True
+                return None
+        return last_id
+
+    def edit_message(self, chat_id, message_id: int, text: str, **extra) -> dict:
+        """Правит отправленное сообщение (editMessageText). Лимит тот же:
+        1-4096 символов; инлайн-сообщения правятся через inline_message_id."""
+        return self.call(os.environ.get("BOT_ALIAS", "salut"), "editMessageText",
+                         {"chat_id": chat_id, "message_id": message_id,
+                          "text": text, **extra})
+
+    def delete_message(self, chat_id, message_id: int) -> dict:
+        """Удаляет сообщение (можно и чужое, если бот админ в группе)."""
+        return self.call(os.environ.get("BOT_ALIAS", "salut"), "deleteMessage",
+                         {"chat_id": chat_id, "message_id": message_id})
 
 
 def notify(text: str, level: str = "info", project: str = "",
@@ -152,7 +167,7 @@ def notify(text: str, level: str = "info", project: str = "",
     label = f" [{project}]" if project else ""
     try:
         c = TgBridgeClient.from_env()
-        return c.send_message(admin_chat_id, f"{emoji}{label} {text}")
+        return c.send_message(admin_chat_id, f"{emoji}{label} {text}") is not None
     except Exception:  # noqa: BLE001 — уведомление не должно ронять проект
         return False
 

@@ -44,7 +44,8 @@ sudo systemctl enable --now tg-bridge
 curl -s http://127.0.0.1:8080/healthz
 ```
 
-SIGHUP перечитывает конфиг без рестарта: `systemctl reload tg-bridge`.
+Смена конфига требует рестарта (мост stateless, даунтайм < секунды):
+`sudo systemctl restart tg-bridge`.
 
 ## 4. Клиенты
 

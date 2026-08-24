@@ -80,7 +80,7 @@ REST+HMAC: вызывается из `curl`, Python `requests` за 10 стро�
 | `auth` | проверка HMAC-подписи, timestamp-окна, IP allowlist |
 | `proxy` | пул соединений к api.telegram.org, таймауты, ретраи read-only методов |
 | `actions` | рендер шаблонов действий из конфига |
-| `config` | TOML + env-интерполяция (`env:VAR`, `file:/path`), hot-reload SIGHUP |
+| `config` | TOML + env-интерполяция (`env:VAR`, `file:/path`) |
 | `limits` | per-client rate limit, лимит тела запроса |
 
 ## 4. Поток запроса

@@ -10,7 +10,6 @@ Group=tg-bridge
 Environment=TGB_CONFIG=/etc/tg-bridge/tg-bridge.toml
 EnvironmentFile=/etc/tg-bridge/env
 ExecStart=/usr/local/bin/tg-bridge
-ReloadSignal=SIGHUP
 Restart=on-failure
 RestartSec=2
 
