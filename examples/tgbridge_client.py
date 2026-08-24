@@ -22,10 +22,39 @@ import time
 import urllib.request
 
 HTTP_TIMEOUT = 35.0  # >= long-poll timeout (25s) + запас
+TEXT_LIMIT = 4096    # лимит Telegram на текст сообщения (после entities)
 
 
 class TgBridgeError(RuntimeError):
     """Ошибка моста или Telegram (description содержит tgb: для ошибок моста)."""
+
+
+def escape_html(text: str) -> str:
+    """Экранирование для parse_mode="HTML". Обязательно для пользовательского
+    ввода, иначе <, >, & ломают разметку (вектор инъекции entities)."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def split_text(text: str, limit: int = TEXT_LIMIT):
+    """Режет длинный текст на куски <= limit символов (по строкам, затем жёстко)."""
+    if len(text) <= limit:
+        return [text]
+    chunks, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur += line
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 class TgBridgeClient:
@@ -66,6 +95,51 @@ class TgBridgeClient:
         return TgBridgeClient(os.environ["TGB_URL"], os.environ["TGB_CLIENT"],
                               os.environ["TGB_SECRET"])
 
+    def call(self, bot_alias: str, method: str, payload: dict,
+             req_timeout: float = HTTP_TIMEOUT) -> dict:
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        ts = int(time.time())
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/t/{bot_alias}/{method}",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-TgB-Client": self.client_name,
+                "X-TgB-Timestamp": str(ts),
+                "X-TgB-Signature": self._sign(ts, body),
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=req_timeout) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            raise TgBridgeError(f"HTTP {e.code}: {detail}") from None
+
+    def send_message(self, chat_id, text: str,
+                     max_retries: int = 3, **extra) -> bool:
+        """Отправка с чанкингом длинных текстов и ретраями по retry_after."""
+        for chunk in split_text(text):
+            payload = {"chat_id": chat_id, "text": chunk, **extra}
+            delivered = False
+            for attempt in range(max_retries):
+                try:
+                    r = self.call(os.environ.get("BOT_ALIAS", "salut"),
+                                  "sendMessage", payload)
+                    if r.get("ok"):
+                        delivered = True
+                        break
+                    params = (r.get("result") or {}).get("parameters") or {}
+                    time.sleep(min(params.get("retry_after", 2 ** attempt), 30))
+                except TgBridgeError as e:
+                    if "429" not in str(e):
+                        break
+                    time.sleep(min(2 ** attempt, 30))
+            if not delivered:
+                return False
+        return True
+
 
 def notify(text: str, level: str = "info", project: str = "",
            admin_chat_id: int | None = None) -> bool:
@@ -77,11 +151,8 @@ def notify(text: str, level: str = "info", project: str = "",
     emoji = {"info": "\u2139\ufe0f", "warn": "\u26a0\ufe0f", "error": "\U0001f6a8"}.get(level, "")
     label = f" [{project}]" if project else ""
     try:
-        c = TgBridgeClient(os.environ["TGB_URL"], os.environ["TGB_CLIENT"],
-                           os.environ["TGB_SECRET"])
-        r = c.call(os.environ.get("BOT_ALIAS", "salut"), "sendMessage",
-                   {"chat_id": admin_chat_id, "text": f"{emoji}{label} {text}"})
-        return bool(r.get("ok"))
+        c = TgBridgeClient.from_env()
+        return c.send_message(admin_chat_id, f"{emoji}{label} {text}")
     except Exception:  # noqa: BLE001 — уведомление не должно ронять проект
         return False
 

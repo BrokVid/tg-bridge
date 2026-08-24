@@ -120,15 +120,64 @@ fn authenticate_body(
     let ts = header_str(headers, "x-tgb-timestamp")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    if (now_secs() - ts).abs() > st.cfg.server.timestamp_window_secs {
+    // abs_diff: no overflow on extreme timestamps
+    if now_secs().abs_diff(ts) > st.cfg.server.timestamp_window_secs as u64 {
         return Err(tgb_error(StatusCode::UNAUTHORIZED, "timestamp out of window"));
     }
     let signature = header_str(headers, "x-tgb-signature").unwrap_or_default();
+    // cap before hex::decode to avoid decoding attacker-controlled blobs
+    if signature.is_empty() || signature.len() > 128 {
+        return Err(tgb_error(StatusCode::UNAUTHORIZED, "bad signature"));
+    }
     if !auth::verify(client.secret.as_bytes(), ts, body, &signature) {
         tracing::warn!(client = %client_name, "bad signature");
         return Err(tgb_error(StatusCode::UNAUTHORIZED, "bad signature"));
     }
     Ok((client_name, client))
+}
+
+/// Path segments must be conservative identifiers: they are interpolated into
+/// the upstream URL. Bot API method names are case-insensitive alphanumerics
+/// with underscores; bot aliases follow the same charset (config-side).
+fn valid_method_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn valid_alias_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Telegram message length limits (Bot API 10.2): sendMessage/editMessageText
+/// text is 1..=4096 chars; media captions are 0..=1024 chars.
+fn validate_telegram_lengths(method: &str, params: &serde_json::Value) -> Result<(), &'static str> {
+    let get_len = |field: &str| -> Option<usize> {
+        params.get(field).and_then(|v| v.as_str()).map(|s| s.chars().count())
+    };
+    let m = method.to_ascii_lowercase();
+    match m.as_str() {
+        "sendmessage" | "editmessagetext" => {
+            if get_len("text").is_some_and(|n| n > 4096) {
+                return Err("text exceeds Telegram limit of 4096 characters");
+            }
+        }
+        "sendphoto" | "sendvideo" | "senddocument" | "sendaudio" | "sendanimation"
+        | "sendvoice" | "sendmedianote" | "sendlivephoto" | "editmessagecaption" => {
+            if get_len("caption").is_some_and(|n| n > 1024) {
+                return Err("caption exceeds Telegram limit of 1024 characters");
+            }
+        }
+        "answercallbackquery" if get_len("text").is_some_and(|n| n > 200) => {
+            return Err("text exceeds Telegram limit of 200 characters");
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn passthrough(
@@ -152,6 +201,9 @@ async fn passthrough_impl(
     let kind = "passthrough";
     if body.len() > st.cfg.server.max_body_bytes {
         return tgb_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
+    }
+    if !valid_alias_segment(&alias) || !valid_method_segment(&method) {
+        return tgb_error(StatusCode::BAD_REQUEST, "invalid alias or method");
     }
     let (client_name, client) = match authenticate_body(st, headers, addr.ip(), &body) {
         Ok(v) => v,
@@ -243,6 +295,9 @@ async fn action_impl(
     if body.len() > st.cfg.server.max_body_bytes {
         return tgb_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
     }
+    if !valid_method_segment(&name) {
+        return tgb_error(StatusCode::BAD_REQUEST, "invalid action name");
+    }
     let (client_name, _client) = match authenticate_body(st, headers, addr.ip(), &body) {
         Ok(v) => v,
         Err(r) => return r,
@@ -279,6 +334,19 @@ async fn action_impl(
             )
         }
     };
+    if let Err(msg) = validate_telegram_lengths(&spec.method, &params) {
+        return tgb_error(StatusCode::BAD_REQUEST, msg);
+    }
+    // security-relevant params (chat_id, etc.) must not be overridable via
+    // template placeholders pointing at client-controlled fields; warn loudly
+    if spec
+        .params
+        .get("chat_id")
+        .map(|v| v.as_str().is_some_and(|s| s.contains("{{")))
+        .unwrap_or(false)
+    {
+        tracing::warn!(action = %name, "action chat_id is templated from client input");
+    }
     let token = &st.cfg.bots[&spec.bot];
     let params_bytes = serde_json::to_vec(&params).expect("serializable");
 

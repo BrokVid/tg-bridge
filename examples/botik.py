@@ -87,14 +87,18 @@ def main() -> int:
     state = {"offset": 0, "events_sent": 0, "started": time.time()}
 
     def send(text: str) -> bool:
-        try:
-            r = br.call(alias, "sendMessage",
-                        {"chat_id": admin_id, "text": text})
-            state["events_sent"] += 1
-            return bool(r.get("ok"))
-        except Exception as e:  # noqa: BLE001
-            log(f"send failed: {e}")
-            return False
+        ok = True
+        for i in range(0, len(text), 4000):  # Telegram: 1-4096 chars per message
+            chunk = text[i:i + 4000]
+            try:
+                r = br.call(alias, "sendMessage",
+                            {"chat_id": admin_id, "text": chunk})
+                state["events_sent"] += 1
+                ok = ok and bool(r.get("ok"))
+            except Exception as e:  # noqa: BLE001
+                log(f"send failed: {e}")
+                ok = False
+        return ok
 
     def handle(text: str) -> str | None:
         cmd = text.strip().split(maxsplit=1)[0].lower() if text.strip() else ""
@@ -118,7 +122,8 @@ def main() -> int:
                 next_heartbeat = time.time() + HEARTBEAT_SECS
 
             r = br.call(alias, "getUpdates",
-                        {"offset": state["offset"], "timeout": POLL_TIMEOUT},
+                        {"offset": state["offset"], "timeout": POLL_TIMEOUT,
+                         "allowed_updates": ["message"]},
                         req_timeout=HTTP_TIMEOUT)
             if not r.get("ok"):
                 log(f"getUpdates error: {r.get('description')}")

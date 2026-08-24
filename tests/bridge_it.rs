@@ -273,3 +273,152 @@ async fn metrics_exposes_counters() {
     .unwrap();
     assert!(text.contains("tgb_requests_total{client=\"testclient\",kind=\"passthrough\",status=\"200\"} 1"));
 }
+
+// ---------- edge cases / input hardening ----------
+
+#[tokio::test]
+async fn extreme_timestamp_rejected_without_overflow() {
+    let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
+    // i64::MIN would overflow naive (now - ts).abs(); must be a clean 401
+    let req = Request::builder()
+        .method("POST")
+        .uri("http://bridge.test/v1/t/salut/getMe")
+        .header("content-type", "application/json")
+        .header("x-tgb-client", CLIENT)
+        .header("x-tgb-timestamp", i64::MIN.to_string())
+        .header(
+            "x-tgb-signature",
+            sign_hex(SECRET.as_bytes(), i64::MIN, b"{}"),
+        )
+        .extension(ConnectInfo("127.0.0.1:55555".parse::<SocketAddr>().unwrap()))
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn oversized_signature_header_rejected() {
+    let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
+    let ts = tg_bridge::now_secs().to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("http://bridge.test/v1/t/salut/getMe")
+        .header("content-type", "application/json")
+        .header("x-tgb-client", CLIENT)
+        .header("x-tgb-timestamp", ts)
+        .header("x-tgb-signature", "a".repeat(10_000))
+        .extension(ConnectInfo("127.0.0.1:55555".parse::<SocketAddr>().unwrap()))
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn path_traversal_in_method_rejected() {
+    let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
+    for evil in ["..", "%2e%2e", "getMe%2Fextra", "get%20me", "%D0%BC"] {
+        let (status, _) = send(
+            router.clone(),
+            &format!("/v1/t/salut/{evil}"),
+            "{}",
+            0,
+            SECRET.as_bytes(),
+            None,
+        )
+        .await;
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+            "{evil}: unexpected {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn oversized_body_rejected() {
+    let mut cfg_over = test_config("http://127.0.0.1:1".into());
+    cfg_over.server.max_body_bytes = 8;
+    let router = tg_bridge::build_router(Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        http: reqwest::Client::new(),
+        cfg: cfg_over,
+    }));
+    let (status, body) =
+        send(router, "/v1/t/salut/getMe", "{\"a\":\"123456789\"}", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["description"], json!("tgb: body too large"));
+}
+
+#[tokio::test]
+async fn action_oversized_text_is_400_not_telegram_error() {
+    // action template renders client text; >4096 chars must be rejected by the bridge
+    let (api_base, last) = fake_telegram().await;
+    let mut cfg = test_config(api_base);
+    if let Some(a) = cfg.actions.get_mut("notify") {
+        a.params["text"] = json!("{{text}}");
+    }
+    let state: SharedState = Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        http: reqwest::Client::new(),
+        cfg,
+    });
+    let router = tg_bridge::build_router(state);
+    let big = "x".repeat(5000);
+    let payload = json!({"text": big}).to_string();
+    let (status, body) = send(router, "/v1/a/notify", &payload, 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["description"],
+        json!("tgb: text exceeds Telegram limit of 4096 characters")
+    );
+    assert!(last.lock().unwrap().is_none(), "nothing must reach upstream");
+}
+
+#[tokio::test]
+async fn action_with_non_object_payload_is_400() {
+    let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
+    let (status, _) = send(router, "/v1/a/notify", "[1,2]", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn deep_nested_action_payload_handled_gracefully() {
+    // serde_json recursion limit turns pathological nesting into a clean 400
+    let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
+    let mut deep = String::from("{\"a\":");
+    for _ in 0..200 {
+        deep.push_str("[{\"a\":");
+    }
+    deep.push('1');
+    for _ in 0..200 {
+        deep.push_str("}]");
+    }
+    deep.push('}');
+    let (status, _) = send(router, "/v1/a/notify", &deep, 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn unknown_bot_alias_is_404() {
+    let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
+    let (status, _) = send(router, "/v1/t/other/getMe", "{}", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn bot_not_allowed_for_client_is_403() {
+    let mut cfg = test_config("http://127.0.0.1:1".into());
+    cfg.bots.insert("other".to_string(), "token".to_string());
+    let state: SharedState = Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        http: reqwest::Client::new(),
+        cfg,
+    });
+    let router = tg_bridge::build_router(state);
+    let (status, _) = send(router, "/v1/t/other/getMe", "{}", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
