@@ -1,0 +1,36 @@
+# /etc/systemd/system/tg-bridge.service
+[Unit]
+Description=Tg Bridge - Telegram Bot API relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tg-bridge
+Group=tg-bridge
+Environment=TGB_CONFIG=/etc/tg-bridge/tg-bridge.toml
+EnvironmentFile=/etc/tg-bridge/env
+ExecStart=/usr/local/bin/tg-bridge
+ReloadSignal=SIGHUP
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/tg-bridge
+
+[Install]
+WantedBy=multi-user.target

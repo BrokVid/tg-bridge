@@ -1,0 +1,340 @@
+//! Tg Bridge library: HMAC-authenticated relay to the Telegram Bot API.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde_json::json;
+
+pub mod actions;
+pub mod auth;
+pub mod config;
+pub mod metrics;
+pub mod proxy;
+pub mod ratelimit;
+
+use metrics::Metrics;
+use ratelimit::RateLimiter;
+
+pub struct AppState {
+    pub cfg: config::Config,
+    pub http: reqwest::Client,
+    pub limiter: RateLimiter,
+    pub metrics: Metrics,
+}
+
+pub type SharedState = Arc<AppState>;
+
+pub fn tgb_error(status: StatusCode, msg: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "error_code": status.as_u16(),
+            "description": format!("tgb: {msg}"),
+        })),
+    )
+        .into_response()
+}
+
+pub fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+async fn healthz() -> Json<serde_json::Value> {
+    Json(json!({"ok": true, "version": env!("CARGO_PKG_VERSION")}))
+}
+
+pub fn build_router(state: SharedState) -> Router {
+    let metrics_enabled = state.cfg.metrics.enabled;
+    let base = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/t/{alias}/{method}", post(passthrough))
+        .route("/v1/a/{name}", post(action));
+    if metrics_enabled {
+        base.route("/metrics", get(metrics_endpoint)).with_state(state)
+    } else {
+        // /metrics disabled: not mounted at all
+        base.with_state(state)
+    }
+}
+fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Shared authentication part 1: client lookup, IP allowlist, header presence.
+/// The timestamp window and HMAC check need the body, see [authenticate_body].
+#[allow(clippy::result_large_err)]
+fn authenticate_basic(
+    st: &AppState,
+    headers: &HeaderMap,
+    ip: std::net::IpAddr,
+) -> Result<(String, config::Client), Response> {
+    let Some(client_name) = header_str(headers, "x-tgb-client") else {
+        return Err(tgb_error(StatusCode::UNAUTHORIZED, "missing X-TgB-Client"));
+    };
+    let Some(_ts_raw) = header_str(headers, "x-tgb-timestamp") else {
+        return Err(tgb_error(
+            StatusCode::UNAUTHORIZED,
+            "missing X-TgB-Timestamp",
+        ));
+    };
+    let Some(_sig) = header_str(headers, "x-tgb-signature") else {
+        return Err(tgb_error(
+            StatusCode::UNAUTHORIZED,
+            "missing X-TgB-Signature",
+        ));
+    };
+    let Some(client) = st.cfg.clients.get(&client_name) else {
+        tracing::warn!(client = %client_name, "unknown client");
+        return Err(tgb_error(StatusCode::UNAUTHORIZED, "unknown client"));
+    };
+    if !client.allowed_ips.is_empty() && !client.allowed_ips.iter().any(|n| n.contains(&ip)) {
+        tracing::warn!(client = %client_name, ip = %ip, "ip not allowed");
+        return Err(tgb_error(StatusCode::UNAUTHORIZED, "ip not allowed"));
+    }
+    Ok((client_name, client.clone()))
+}
+
+/// Full auth: basic checks + timestamp window + constant-time HMAC over
+/// `{timestamp}\n{body}`.
+#[allow(clippy::result_large_err)]
+fn authenticate_body(
+    st: &AppState,
+    headers: &HeaderMap,
+    ip: std::net::IpAddr,
+    body: &[u8],
+) -> Result<(String, config::Client), Response> {
+    let (client_name, client) = authenticate_basic(st, headers, ip)?;
+    let ts = header_str(headers, "x-tgb-timestamp")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    if (now_secs() - ts).abs() > st.cfg.server.timestamp_window_secs {
+        return Err(tgb_error(StatusCode::UNAUTHORIZED, "timestamp out of window"));
+    }
+    let signature = header_str(headers, "x-tgb-signature").unwrap_or_default();
+    if !auth::verify(client.secret.as_bytes(), ts, body, &signature) {
+        tracing::warn!(client = %client_name, "bad signature");
+        return Err(tgb_error(StatusCode::UNAUTHORIZED, "bad signature"));
+    }
+    Ok((client_name, client))
+}
+
+async fn passthrough(
+    State(st): State<SharedState>,
+    Path((alias, method)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    body: axum::body::Bytes,
+) -> Response {
+    passthrough_impl(&st, alias, method, &headers, addr, body).await
+}
+
+async fn passthrough_impl(
+    st: &SharedState,
+    alias: String,
+    method: String,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    body: axum::body::Bytes,
+) -> Response {
+    let kind = "passthrough";
+    if body.len() > st.cfg.server.max_body_bytes {
+        return tgb_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
+    }
+    let (client_name, client) = match authenticate_body(st, headers, addr.ip(), &body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !st.limiter.allow(&client_name) {
+        st.metrics.record_request(&client_name, kind, 429, 0);
+        return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+
+    let result = resolve_bot_and_check_method(st, &client, &alias, &method);
+    let token = match result {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
+    let started = std::time::Instant::now();
+    let resp = proxy::passthrough_response(
+        &st.http,
+        &st.cfg.telegram.api_base,
+        &token,
+        &alias,
+        &method,
+        body,
+    )
+    .await;
+    let ms = started.elapsed().as_millis() as u64;
+    match resp {
+        Ok(r) => {
+            st.metrics
+                .record_request(&client_name, kind, r.status().as_u16(), ms);
+            tracing::info!(
+                client = %client_name,
+                bot = %alias,
+                method = %method,
+                status = r.status().as_u16(),
+                ms,
+                "proxied"
+            );
+            r
+        }
+        Err(e) => {
+            st.metrics.record_upstream_error(kind);
+            tracing::error!(client = %client_name, method = %method, error = %e, "upstream error");
+            tgb_error(StatusCode::BAD_GATEWAY, "telegram unreachable")
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_bot_and_check_method(
+    st: &AppState,
+    client: &config::Client,
+    alias: &str,
+    method: &str,
+) -> Result<String, Response> {
+    let Some(token) = st.cfg.bots.get(alias) else {
+        return Err(tgb_error(StatusCode::NOT_FOUND, "unknown bot alias"));
+    };
+    if !client.bots.is_empty() && !client.bots.iter().any(|b| b == alias) {
+        return Err(tgb_error(StatusCode::FORBIDDEN, "bot not allowed for client"));
+    }
+    if let Some(list) = &client.methods_allowlist {
+        if !list.iter().any(|m| m == method) {
+            return Err(tgb_error(StatusCode::FORBIDDEN, "method not allowed for client"));
+        }
+    }
+    Ok(token.clone())
+}
+
+async fn action(
+    State(st): State<SharedState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    body: axum::body::Bytes,
+) -> Response {
+    action_impl(&st, name, &headers, addr, body).await
+}
+
+async fn action_impl(
+    st: &SharedState,
+    name: String,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    body: axum::body::Bytes,
+) -> Response {
+    let kind = "action";
+    if body.len() > st.cfg.server.max_body_bytes {
+        return tgb_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
+    }
+    let (client_name, _client) = match authenticate_body(st, headers, addr.ip(), &body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !st.limiter.allow(&client_name) {
+        st.metrics.record_request(&client_name, kind, 429, 0);
+        return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+
+    let Some(spec) = st.cfg.actions.get(&name).cloned() else {
+        return tgb_error(StatusCode::NOT_FOUND, "unknown action");
+    };
+    if spec.client != client_name {
+        return tgb_error(StatusCode::FORBIDDEN, "action not allowed for client");
+    }
+    if !st.cfg.bots.contains_key(&spec.bot) {
+        return tgb_error(StatusCode::NOT_FOUND, "unknown bot alias");
+    }
+
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return tgb_error(StatusCode::BAD_REQUEST, &format!("bad json: {e}")),
+    };
+    let payload_map = match payload.as_object() {
+        Some(m) => m.clone(),
+        None => return tgb_error(StatusCode::BAD_REQUEST, "json object expected"),
+    };
+    let params = match actions::render_params(&spec.params, &payload_map) {
+        Ok(p) => p,
+        Err(missing) => {
+            return tgb_error(
+                StatusCode::BAD_REQUEST,
+                &format!("missing fields: {}", missing.join(", ")),
+            )
+        }
+    };
+    let token = &st.cfg.bots[&spec.bot];
+    let params_bytes = serde_json::to_vec(&params).expect("serializable");
+
+    let started = std::time::Instant::now();
+    match proxy::send_json(
+        &st.http,
+        &st.cfg.telegram.api_base,
+        token,
+        &spec.bot,
+        &spec.method,
+        params_bytes,
+    )
+    .await
+    {
+        Ok((status, tg_json)) => {
+            let ms = started.elapsed().as_millis() as u64;
+            st.metrics.record_request(&client_name, kind, status, ms);
+            tracing::info!(
+                client = %client_name,
+                action = %name,
+                method = %spec.method,
+                status,
+                ms,
+                "action executed"
+            );
+            let telegram_ok = tg_json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "telegram_ok": telegram_ok, "result": tg_json})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            st.metrics.record_upstream_error(kind);
+            tracing::error!(client = %client_name, action = %name, error = %e, "upstream error");
+            tgb_error(StatusCode::BAD_GATEWAY, "telegram unreachable")
+        }
+    }
+}
+
+async fn metrics_endpoint(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    // protected like every other endpoint; returns global aggregates only
+    if let Err(r) = authenticate_body(&st, &headers, addr.ip(), b"") {
+        return r;
+    }
+    if !st.limiter.allow("metrics") {
+        return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+    let text = st.metrics.render();
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        text,
+    )
+        .into_response()
+}

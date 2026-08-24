@@ -1,0 +1,59 @@
+# Конфигурация Tg Bridge (пример)
+# Рабочий конфиг кладите в config/local/ или /opt/tg-bridge/ — он не коммитится.
+# Секреты подставляются через env:VAR (переменная окружения) или file:/path (файл с секретом).
+
+[server]
+# Слушать на loopback/приватном интерфейсе; для публичного порта ограничьте
+# доступ фаерволом (allowed_ips) и/или поставьте TLS-фронт.
+listen = "127.0.0.1:8080"
+max_body_bytes = 65536
+request_timeout_secs = 35     # должно быть больше long-poll timeout клиентов (25 c)
+timestamp_window_secs = 60    # допустимое расхождение часов с клиентами
+
+[telegram]
+api_base = "https://api.telegram.org"
+
+[rate_limit]                  # per client, фиксированное окно 1 минута
+requests_per_minute = 120
+
+[metrics]                     # GET /metrics (Prometheus text), защищён HMAC
+enabled = true
+
+# --- Боты: токены живут только здесь, клиенты обращаются по алиасу ---
+
+[bots.salut]
+token = "env:TGB_BOT_SALUT_TOKEN"
+
+# --- Клиенты: серверы фермы, которым разрешён доступ ---
+
+[[clients]]
+name = "salut66"                    # X-TgB-Client
+secret = "env:TGB_CLIENT_SALUT66_SECRET"
+allowed_ips = ["176.109.110.202/32"]   # опционально: пусто = любые IP
+bots = ["salut"]                    # какие алиасы доступны клиенту
+methods_allowlist = [               # опционально: пусто/отсутствие = любые методы
+  "getMe",
+  "sendMessage",
+  "getUpdates",
+  "answerCallbackQuery",
+  "setMyCommands",
+]
+
+[[clients]]
+name = "homepc"
+secret = "env:TGB_CLIENT_HOMEPC_SECRET"
+bots = ["salut"]
+
+# --- Действия: POST /v1/a/{name} ---
+# Клиент шлёт семантический JSON, мост рендерит params подстановкой
+# {{field}} / {{field|default}} из полей запроса и вызывает метод Bot API.
+
+[[actions]]
+name = "notify_admins"
+client = "salut66"            # кто может вызывать
+bot = "salut"
+method = "sendMessage"
+
+[actions.params]
+chat_id = -1001234567890      # куда слать (id админ-чата живёт на мосте)
+text = "[{{level|info}}] {{title|event}}: {{text}}"

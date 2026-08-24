@@ -1,0 +1,20 @@
+# Rust
+/target/
+Cargo.lock.bak
+
+# Secrets & local configs (NEVER commit)
+.env
+.env.*
+!.env.example
+config/local/*
+!config/local/.gitkeep
+
+# Private notes
+docs/private/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+# /etc/systemd/system/tg-botik.service
+[Unit]
+Description=Tg Bridge test client (botik)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tg-botik
+Group=tg-botik
+EnvironmentFile=/etc/tg-botik/env
+ExecStart=/usr/bin/python3 /opt/tg-bridge/botik.py
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
