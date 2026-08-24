@@ -71,6 +71,26 @@ de-01; HMAC-секрет + ADMIN_TG_ID — только /etc/tg-botik/env на r
 - Сценарий использования: дать агенту проекта ссылку на INTEGRATION.md
   и 5 значений env — больше ничего не нужно.
 
+## Релиз v0.1.0 (2026-08-24)
+
+- Реализовано из ранее описанного: действия `[[actions]]` (глобальный массив,
+  привязка к клиенту, шаблоны `{{field}}` / `{{field|default}}`, ответ
+  `{ok, telegram_ok, result}`) и `/metrics` (Prometheus text, защищён HMAC,
+  агрегаты, отключается `[metrics] enabled=false`).
+- lib/bin сплит (`src/lib.rs` + тонкий main) ради интеграционных тестов:
+  `tests/bridge_it.rs`, 11 тестов против фейкового Telegram-сервера
+  (auth, rate limit, passthrough, actions, metrics). Итого 20 тестов.
+- CI: `.github/workflows/ci.yml` (build --locked / clippy -D warnings / test).
+- git init, коммит `977e5f0`, тег `v0.1.0`. Публичный GitHub — по готовности.
+- de-01 передеплоен: новый бинарник + в боевом конфиге добавлено действие
+  notify_admins (chat_id = админ). Проверено сквозняком с ru-01 через
+  call_action: сообщение пришло в чат.
+- В tgbridge_client.py добавлены call_action() и from_env().
+
+Грабли деплоя: here-doc и вложенные кавычки через ssh/cmd не пробрасывать —
+файлы скриптов заливать scp'ом и выполнять sudo bash. serde flatten +
+toml для [[actions]] работает (toml 1.1).
+
 ## Следующий шаг
 
 Каркас готов и задеплоен. Дальше по мере надобности: TLS-фронт, nonce-кэш,

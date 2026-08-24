@@ -38,12 +38,13 @@ class TgBridgeClient:
         msg = f"{timestamp}\n".encode() + body
         return hmac.new(self.secret, msg, hashlib.sha256).hexdigest()
 
-    def call(self, bot_alias: str, method: str, payload: dict,
-             req_timeout: float = HTTP_TIMEOUT) -> dict:
+    def call_action(self, action: str, payload: dict,
+                    req_timeout: float = 15.0) -> dict:
+        """Вызывает именованное действие моста POST /v1/a/{action}."""
         body = json.dumps(payload, ensure_ascii=False).encode()
         ts = int(time.time())
         req = urllib.request.Request(
-            f"{self.base_url}/v1/t/{bot_alias}/{method}",
+            f"{self.base_url}/v1/a/{action}",
             data=body,
             method="POST",
             headers={
@@ -59,6 +60,11 @@ class TgBridgeClient:
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")
             raise TgBridgeError(f"HTTP {e.code}: {detail}") from None
+
+    @staticmethod
+    def from_env() -> "TgBridgeClient":
+        return TgBridgeClient(os.environ["TGB_URL"], os.environ["TGB_CLIENT"],
+                              os.environ["TGB_SECRET"])
 
 
 def notify(text: str, level: str = "info", project: str = "",
