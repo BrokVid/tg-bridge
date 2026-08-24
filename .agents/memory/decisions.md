@@ -91,6 +91,22 @@ de-01; HMAC-секрет + ADMIN_TG_ID — только /etc/tg-botik/env на r
 файлы скриптов заливать scp'ом и выполнять sudo bash. serde flatten +
 toml для [[actions]] работает (toml 1.1).
 
+## Хардненинг (2026-08-24)
+
+- Сверено с Bot API 10.2 (14.07.2026): sendMessage/editMessageText 1–4096,
+  caption 0–1024, answerCallbackQuery 0–200, setMyCommands ≤100,
+  getUpdates limit 1–100 + offset=update_id+1 + несовместим с webhook.
+- Мост: валидация сегментов пути ([A-Za-z0-9_-], ≤64) до авторизации;
+  капа на длину подписи (128) перед hex-decode; abs_diff вместо вычитания
+  (нет переполнения i64::MIN); лимиты длины Telegram для действий — 400
+  до отправки; serde_json recursion limit против глубокой вложенности;
+  предупреждение в лог при шаблонизации chat_id из клиентских полей.
+- Клиенты: send_message() с чанкингом >4096 и ретраями по retry_after;
+  escape_html() для parse_mode; botik шлёт кусками по 4000 и фильтрует
+  allowed_updates=["message"].
+- Тестов стало 29 (9 unit + 20 integration). Проверено вживую:
+  get%2Fextra → 400 до auth; ботик перезапущен и работает.
+
 ## Следующий шаг
 
 Каркас готов и задеплоен. Дальше по мере надобности: TLS-фронт, nonce-кэш,
