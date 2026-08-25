@@ -1,58 +1,96 @@
 # Tg Bridge
 
+[README in English](README.md)
+
+[![CI](https://github.com/BrokVid/tg-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/BrokVid/tg-bridge/actions/workflows/ci.yml)
+[![Release](https://github.com/BrokVid/tg-bridge/actions/workflows/release.yml/badge.svg)](https://github.com/BrokVid/tg-bridge/actions/workflows/release.yml)
+
 Крошечный быстрый self-hosted релей между вашими серверами и Telegram Bot API.
 
 Разворачивается на любом VPS с доступом к `api.telegram.org`. Остальные машины
-(например, ноды за национальными блокировками) дергают мост по HTTP с
-HMAC-подписанным запросом; мост пересылает вызов в Telegram и возвращает ответ.
-Токены ботов живут **только** на хосте моста — клиенты их не видят.
+(например, ноды за сетевыми блокировками) дергают мост по HTTP с
+HMAC-подписанным запросом; мост пересылает вызов в Telegram и возвращает ответ
+дословно. Токены ботов живут **только** на хосте моста — клиенты их не видят.
 
 ## Зачем
 
-Типовой сценарий: проект крутится на VPS внутри России, ему нужен вход через
-Telegram и уведомления админам, но `api.telegram.org` оттуда недоступен.
-Tg Bridge ставится на незаблокированный VPS и становится единой точкой выхода
-в Telegram для всей фермы серверов.
+Типовой сценарий: приложение крутится там, где `api.telegram.org` недоступен
+или ходить на него с каждой ноды нежелательно. Tg Bridge становится единственной
+контролируемой точкой выхода в Telegram для всей фермы серверов:
+
+- **Изоляция токенов** — компрометация клиента не раскрывает токен бота;
+  ротация токена не требует правок на клиентах.
+- **Per-client контроль доступа** — HMAC, окно времени, защита от replay,
+  IP allowlist, белый список методов, rate limit.
+- **Без состояния** — нет базы данных, безопасные рестарты, ~5–10 МБ RAM.
+- **Уведомления и боты** — слать сообщения из cron, CI, мониторинга;
+  интерактивные боты через long polling или webhook-релей.
 
 ## Возможности
 
-- Один статический бинарник Rust (~5–10 МБ RAM в простое, без рантайм-зависимостей)
-- Прозрачный passthrough любого метода Bot API + опциональные именованные «действия»
-- Per-client авторизация HMAC-SHA256 с меткой времени (защита от replay)
-- Опционально: IP allowlist по клиенту, белый список методов, rate limit
-- Без базы данных и состояния — безопасен для рестартов
-- Конфиг в TOML; секреты через переменные окружения или файлы
+- Прозрачный passthrough любого метода Bot API: JSON **и** multipart
+  (отправка файлов до ~50 МБ)
+- Именованные «действия»: клиент шлёт семантический JSON (`title`, `text`,
+  `level`), мост сам собирает сконфигурированный вызов Telegram
+- Webhook-релей: Telegram пушит апдейты на `/webhook/{alias}`, мост доставляет
+  их клиенту с HMAC-подписью
+- Защита от replay (in-memory nonce-кэш), constant-time сравнение подписей
+- Метрики Prometheus на `/metrics` под той же аутентификацией
+- Один статический бинарник Rust, конфиг TOML, секреты через env или файлы
 
 ## Быстрый старт
 
+Установка одной командой на хосте моста (Ubuntu/Debian с systemd):
+
 ```bash
-cargo build --release
-cp config/tg-bridge.example.toml config/local/tg-bridge.toml
-# правим конфиг, экспортируем секреты
-TGB_CONFIG=config/local/tg-bridge.toml ./target/release/tg-bridge
+curl -fsSL https://raw.githubusercontent.com/BrokVid/tg-bridge/main/install.sh | sudo bash
 ```
 
-Подробности: [docs/DEPLOY.md](docs/DEPLOY.md) (systemd/Docker на Ubuntu 24/26),
-[docs/PROTOCOL.md](docs/PROTOCOL.md) (протокол),
-[examples/python_client.py](examples/python_client.py) (готовый клиент).
+Мастер задаст несколько вопросов (токен бота, адрес, имя клиента), сгенерирует
+секреты, пропишет конфиг и hardened systemd-юнит, напечатает четыре значения
+для клиентских машин.
 
-## Интеграция в свой проект
+Или собрать вручную:
 
-Подключение моста к проекту сводится к одному файлу клиента и четырём
-переменным окружения. Просто дайте эту задачу ИИ-агенту:
+```bash
+cargo build --release
+cp config/tg-bridge.example.toml /etc/tg-bridge/tg-bridge.toml
+TGB_CONFIG=/etc/tg-bridge/tg-bridge.toml ./target/release/tg-bridge
+```
 
-> Прочитай [docs/INTEGRATION.md](docs/INTEGRATION.md) и интегрируй Tg Bridge
-> в этот проект: уведомления админу и обработка его сообщений. Значения
-> TGB_URL / TGB_CLIENT / TGB_SECRET / BOT_ALIAS / ADMIN_TG_ID возьми из env
-> (владелец моста их выдаёт).
+Статические бинарники прикреплены к каждому
+[релизу на GitHub](https://github.com/BrokVid/tg-bridge/releases)
+(собираются GitHub Actions).
 
-Готовый drop-in модуль: [examples/tgbridge_client.py](examples/tgbridge_client.py).
+## Интеграция в проект
+
+Drop-in модуль на Python: [examples/tgbridge_client.py](examples/tgbridge_client.py).
+Работающий демо-бот: [examples/demo_bot.py](examples/demo_bot.py).
+
+```python
+from tgbridge_client import TgBridgeClient
+
+tg = TgBridgeClient(tgb_url, tgb_client, tgb_secret)
+tg.call(bot_alias, "sendMessage", {"chat_id": admin_id, "text": "deploy ok"})
+```
+
+Дайте ИИ-агенту [docs/INTEGRATION.md](docs/INTEGRATION.md) и четыре значения env
+(`TGB_URL`, `TGB_CLIENT`, `TGB_SECRET`, `BOT_ALIAS`) — этого достаточно, чтобы
+подключить уведомления к любому проекту.
+
+## Документация
+
+| Документ | Содержимое |
+|---|---|
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Протокол v1: эндпоинты, заголовки, формат ошибок, лимиты, справочник конфига |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | Развёртывание на Ubuntu 24/26: systemd, Docker, TLS-фронт |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | Самодостаточный чеклист для человека и ИИ-агента по подключению моста |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Проектные решения (ADR), компоненты, модель безопасности |
 
 ## Статус
 
-v0.1.0 — работает в проде на ферме автора: passthrough, действия, метрики,
-rate limiting, интеграционные тесты. Roadmap: TLS-фронт, nonce-кэш,
-multipart (файлы), webhook-режим.
+v1.0.0 — работает в проде. Протокол `/v1/` заморожен: несовместимые изменения
+пойдут в `/v2/`, совместимость сохраняется минимум год.
 
 ## Лицензия
 

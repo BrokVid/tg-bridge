@@ -123,11 +123,11 @@ sendPhoto, sendDocument и прочие загрузки. Подпись счи�
 Конфиг бота (все три ключа вместе или ни одного):
 
 ```toml
-[bots.salut]
+[bots.mybot]
 token = "..."
 webhook_secret = "env:TGB_SALUT_WEBHOOK_SECRET"
 webhook_url = "https://client.example/tg/callback"   # куда доставлять
-webhook_client = "salut66"                            # чьим секретом подписать
+webhook_client = "myapp"                            # чьим секретом подписать
 ```
 
 Доставка клиенту подписана тем же HMAC-протоколом (`X-TgB-Timestamp`,

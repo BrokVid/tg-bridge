@@ -40,7 +40,7 @@ fn test_config(api_base: String) -> Config {
         metrics: MetricsCfg { enabled: true },
         bots: HashMap::from([
             (
-                "salut".to_string(),
+                "mybot".to_string(),
                 Bot {
                     token: "123456:FAKE-TOKEN".to_string(),
                     webhook: None,
@@ -59,7 +59,7 @@ fn test_config(api_base: String) -> Config {
             Client {
                 secret: SECRET.into(),
                 allowed_ips: vec![],
-                bots: vec!["salut".into()],
+                bots: vec!["mybot".into()],
                 allow_passthrough: true,
                 methods_allowlist: Some(vec![
                     "getMe".into(),
@@ -72,7 +72,7 @@ fn test_config(api_base: String) -> Config {
             "notify".to_string(),
             serde_json::from_value(json!({
                 "client": CLIENT,
-                "bot": "salut",
+                "bot": "mybot",
                 "method": "sendMessage",
                 "params": {
                     "chat_id": -100123,
@@ -207,7 +207,7 @@ async fn unsigned_request_rejected() {
     let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
     let req = Request::builder()
         .method("POST")
-        .uri("http://bridge.test/v1/t/salut/getMe")
+        .uri("http://bridge.test/v1/t/mybot/getMe")
         .extension(ConnectInfo("127.0.0.1:55555".parse::<SocketAddr>().unwrap()))
         .body(Body::from("{}"))
         .unwrap();
@@ -218,7 +218,7 @@ async fn unsigned_request_rejected() {
 #[tokio::test]
 async fn bad_signature_rejected() {
     let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
-    let (status, body) = send(router, "/v1/t/salut/getMe", "{}", 0, b"wrong", None).await;
+    let (status, body) = send(router, "/v1/t/mybot/getMe", "{}", 0, b"wrong", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["description"], json!("tgb: bad signature"));
 }
@@ -226,7 +226,7 @@ async fn bad_signature_rejected() {
 #[tokio::test]
 async fn stale_timestamp_rejected() {
     let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
-    let (status, _) = send(router, "/v1/t/salut/getMe", "{}", -120, SECRET.as_bytes(), None).await;
+    let (status, _) = send(router, "/v1/t/mybot/getMe", "{}", -120, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -235,7 +235,7 @@ async fn passthrough_forwards_to_telegram() {
     let tg = fake_telegram().await;
     let router = tg_bridge::build_router(test_state(tg.api_base.clone()));
     let (status, body) =
-        send(router, "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+        send(router, "/v1/t/mybot/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["result"]["method"], json!("getMe"));
@@ -246,7 +246,7 @@ async fn disallowed_method_rejected() {
     let router = tg_bridge::build_router(test_state("http://127.0.0.1:1".into()));
     // deleteWebhook is not in methods_allowlist
     let (status, body) =
-        send(router, "/v1/t/salut/deleteWebhook", "{}", 0, SECRET.as_bytes(), None).await;
+        send(router, "/v1/t/mybot/deleteWebhook", "{}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["description"], json!("tgb: method not allowed for client"));
 }
@@ -290,7 +290,7 @@ async fn rate_limit_blocks_burst() {
     for i in 0..3 {
         let r = send(
             router.clone(),
-            "/v1/t/salut/getMe",
+            "/v1/t/mybot/getMe",
             &format!("{{\"a\":{i}}}"),
             0,
             SECRET.as_bytes(),
@@ -300,7 +300,7 @@ async fn rate_limit_blocks_burst() {
         assert_eq!(r.0, StatusCode::OK);
     }
     let (status, body) =
-        send(router, "/v1/t/salut/getMe", "{\"a\":3}", 0, SECRET.as_bytes(), None).await;
+        send(router, "/v1/t/mybot/getMe", "{\"a\":3}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["description"], json!("tgb: rate limited"));
 }
@@ -310,7 +310,7 @@ async fn metrics_exposes_counters() {
     let tg = fake_telegram().await;
     let state = test_state(tg.api_base);
     let router = tg_bridge::build_router(state.clone());
-    let _ = send(router.clone(), "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+    let _ = send(router.clone(), "/v1/t/mybot/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
 
     let req = Request::builder()
         .method("GET")
@@ -346,7 +346,7 @@ async fn extreme_timestamp_rejected_without_overflow() {
     // i64::MIN would overflow naive (now - ts).abs(); must be a clean 401
     let req = Request::builder()
         .method("POST")
-        .uri("http://bridge.test/v1/t/salut/getMe")
+        .uri("http://bridge.test/v1/t/mybot/getMe")
         .header("content-type", "application/json")
         .header("x-tgb-client", CLIENT)
         .header("x-tgb-timestamp", i64::MIN.to_string())
@@ -367,7 +367,7 @@ async fn oversized_signature_header_rejected() {
     let ts = tg_bridge::now_secs().to_string();
     let req = Request::builder()
         .method("POST")
-        .uri("http://bridge.test/v1/t/salut/getMe")
+        .uri("http://bridge.test/v1/t/mybot/getMe")
         .header("content-type", "application/json")
         .header("x-tgb-client", CLIENT)
         .header("x-tgb-timestamp", ts)
@@ -385,7 +385,7 @@ async fn path_traversal_in_method_rejected() {
     for evil in ["..", "%2e%2e", "getMe%2Fextra", "get%20me", "%D0%BC"] {
         let (status, _) = send(
             router.clone(),
-            &format!("/v1/t/salut/{evil}"),
+            &format!("/v1/t/mybot/{evil}"),
             "{}",
             0,
             SECRET.as_bytes(),
@@ -411,7 +411,7 @@ async fn oversized_body_rejected() {
         cfg: cfg_over,
     }));
     let (status, body) =
-        send(router, "/v1/t/salut/getMe", "{\"a\":\"123456789\"}", 0, SECRET.as_bytes(), None).await;
+        send(router, "/v1/t/mybot/getMe", "{\"a\":\"123456789\"}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["description"], json!("tgb: body too large"));
 }
@@ -470,7 +470,7 @@ async fn multipart_upload_forwarded_verbatim() {
 
     let (status, resp) = send_bytes(
         router,
-        "/v1/t/salut/sendDocument",
+        "/v1/t/mybot/sendDocument",
         body.clone(),
         0,
         SECRET.as_bytes(),
@@ -501,7 +501,7 @@ async fn oversized_upload_rejected_before_upstream() {
     let big_body = vec![b'x'; 64];
     let (status, _resp) = send_bytes(
         router,
-        "/v1/t/salut/sendDocument",
+        "/v1/t/mybot/sendDocument",
         big_body,
         0,
         SECRET.as_bytes(),
@@ -531,7 +531,7 @@ async fn json_over_upload_limit_but_under_json_limit_is_ok() {
         cfg,
     });
     let router = tg_bridge::build_router(state);
-    let (status, _) = send(router, "/v1/t/salut/getMe", "{\"a\":\"123456789\"}", 0, SECRET.as_bytes(), None).await;
+    let (status, _) = send(router, "/v1/t/mybot/getMe", "{\"a\":\"123456789\"}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -655,7 +655,7 @@ async fn send_webhook(
 
 fn state_with_webhook(api_base: String, client_url: String) -> SharedState {
     let mut cfg = test_config(api_base);
-    cfg.bots.get_mut("salut").unwrap().webhook = Some(WebhookTarget {
+    cfg.bots.get_mut("mybot").unwrap().webhook = Some(WebhookTarget {
         secret: WEBHOOK_SECRET.into(),
         url: client_url,
         client: CLIENT.into(),
@@ -679,7 +679,7 @@ async fn webhook_relays_signed_update_to_client() {
 
     let update = json!({"update_id": 42, "message": {"text": "hi"}}).to_string();
     let (status, body) =
-        send_webhook(router, "salut", Some(WEBHOOK_SECRET), &update).await;
+        send_webhook(router, "mybot", Some(WEBHOOK_SECRET), &update).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
 
     let cap = fc.captured.lock().unwrap().clone().expect("delivered");
@@ -697,7 +697,7 @@ async fn webhook_bad_secret_rejected_without_delivery() {
         fc.url.clone(),
     ));
     let (status, _) =
-        send_webhook(router, "salut", Some("totally-wrong"), "{}").await;
+        send_webhook(router, "mybot", Some("totally-wrong"), "{}").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(fc.captured.lock().unwrap().is_none());
 }
@@ -724,7 +724,7 @@ async fn webhook_failed_delivery_returns_bad_gateway() {
         "http://127.0.0.1:1/tg/callback".into(),
     ));
     let (status, _) =
-        send_webhook(router, "salut", Some(WEBHOOK_SECRET), "{}").await;
+        send_webhook(router, "mybot", Some(WEBHOOK_SECRET), "{}").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
 
@@ -741,7 +741,7 @@ async fn passthrough_denied_when_disabled_for_client() {
     });
     let router = tg_bridge::build_router(state);
     let (status, body) =
-        send(router, "/v1/t/salut/getMe", "{}", 0, SECRET.as_bytes(), None).await;
+        send(router, "/v1/t/mybot/getMe", "{}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["description"], json!("tgb: passthrough not allowed for client"));
 }
@@ -775,12 +775,12 @@ async fn duplicate_signed_request_rejected_as_replay() {
     let state = test_state(tg.api_base);
     let router = tg_bridge::build_router(state.clone());
     let (status, _) =
-        send(router.clone(), "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+        send(router.clone(), "/v1/t/mybot/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::OK);
 
     // byte-identical request within the window is a replay
     let (status, body) =
-        send(router, "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+        send(router, "/v1/t/mybot/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["description"], json!("tgb: replay detected"));
     assert_eq!(tg.last.lock().unwrap().iter().count(), 1, "upstream hit once");
@@ -793,7 +793,7 @@ async fn same_body_new_timestamp_is_not_replay() {
     for ts_offset in [0, -1] {
         let (status, _) = send(
             router.clone(),
-            "/v1/t/salut/getMe",
+            "/v1/t/mybot/getMe",
             "{\"a\":1}",
             ts_offset,
             SECRET.as_bytes(),
@@ -819,7 +819,7 @@ async fn replay_check_disabled_when_configured_off() {
     let router = tg_bridge::build_router(state);
     for _ in 0..2 {
         let (status, _) =
-            send(router.clone(), "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+            send(router.clone(), "/v1/t/mybot/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
         assert_eq!(status, StatusCode::OK);
     }
 }

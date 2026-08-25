@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 
 env = {}
-with open("/etc/tg-botik/env") as f:
+with open("/etc/tg-demo/env") as f:
     for line in f:
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
@@ -19,7 +19,7 @@ with open("/etc/tg-botik/env") as f:
 base = env["TGB_URL"].rstrip("/")
 client = env["TGB_CLIENT"]
 secret = env["TGB_SECRET"].encode()
-alias = env.get("BOT_ALIAS", "salut")
+alias = env.get("BOT_ALIAS", "mybot")
 print("bridge:", base, "| client:", client, "| alias:", alias)
 
 

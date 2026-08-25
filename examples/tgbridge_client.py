@@ -8,7 +8,7 @@ docs/INTEGRATION.md в репозитории tg-bridge.
     TGB_URL      адрес моста, напр. http://31.x.x.x:8080
     TGB_CLIENT   имя клиента на мосте
     TGB_SECRET   HMAC-секрет клиента (64 hex)
-    BOT_ALIAS    алиас бота, напр. salut
+    BOT_ALIAS    алиас бота, напр. mybot
 
 Проверка из командной строки:
     python3 tgbridge_client.py          # выполнит getMe и напечатает ответ
@@ -127,7 +127,7 @@ class TgBridgeClient:
             delivered = False
             for attempt in range(max_retries):
                 try:
-                    r = self.call(os.environ.get("BOT_ALIAS", "salut"),
+                    r = self.call(os.environ.get("BOT_ALIAS", "mybot"),
                                   "sendMessage", payload)
                     if r.get("ok"):
                         last_id = r["result"]["message_id"]
@@ -146,13 +146,13 @@ class TgBridgeClient:
     def edit_message(self, chat_id, message_id: int, text: str, **extra) -> dict:
         """Правит отправленное сообщение (editMessageText). Лимит тот же:
         1-4096 символов; инлайн-сообщения правятся через inline_message_id."""
-        return self.call(os.environ.get("BOT_ALIAS", "salut"), "editMessageText",
+        return self.call(os.environ.get("BOT_ALIAS", "mybot"), "editMessageText",
                          {"chat_id": chat_id, "message_id": message_id,
                           "text": text, **extra})
 
     def delete_message(self, chat_id, message_id: int) -> dict:
         """Удаляет сообщение (можно и чужое, если бот админ в группе)."""
-        return self.call(os.environ.get("BOT_ALIAS", "salut"), "deleteMessage",
+        return self.call(os.environ.get("BOT_ALIAS", "mybot"), "deleteMessage",
                          {"chat_id": chat_id, "message_id": message_id})
 
 

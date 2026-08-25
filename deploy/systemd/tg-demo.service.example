@@ -1,14 +1,14 @@
-# /etc/systemd/system/tg-botik.service
+# /etc/systemd/system/tg-demo.service
 [Unit]
-Description=Tg Bridge test client (botik)
+Description=Tg Bridge test client (demo bot)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=tg-botik
-Group=tg-botik
-EnvironmentFile=/etc/tg-botik/env
-ExecStart=/usr/bin/python3 /opt/tg-bridge/botik.py
+User=tg-demo
+Group=tg-demo
+EnvironmentFile=/etc/tg-demo/env
+ExecStart=/usr/bin/python3 /opt/tg-bridge/demo_bot.py
 Restart=on-failure
 RestartSec=5
 

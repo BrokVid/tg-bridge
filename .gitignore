@@ -11,6 +11,7 @@ config/local/*
 
 # Private notes
 docs/private/
+.agents/
 
 # IDE / OS
 .idea/

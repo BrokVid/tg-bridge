@@ -2,8 +2,8 @@
 """Референсный клиент Tg Bridge. Только стандартная библиотека Python 3.
 
 Использование:
-    client = TgBridgeClient("http://bridge:8080", "salut66", secret)
-    resp = client.call("salut", "sendMessage", {
+    client = TgBridgeClient("http://bridge:8080", "myapp", secret)
+    resp = client.call("mybot", "sendMessage", {
         "chat_id": 123456789,
         "text": "deploy finished",
     })

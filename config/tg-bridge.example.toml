@@ -21,22 +21,22 @@ enabled = true
 
 # --- Боты: токены живут только здесь, клиенты обращаются по алиасу ---
 
-[bots.salut]
+[bots.mybot]
 token = "env:TGB_BOT_SALUT_TOKEN"
-# Webhook-релей: Telegram пушит апдейты на POST /webhook/salut, мост доставляет
+# Webhook-релей: Telegram пушит апдейты на POST /webhook/mybot, мост доставляет
 # их на webhook_url, подписав HMAC-секретом клиента webhook_client.
 # Все три ключа задаются вместе или не задаются вовсе:
 # webhook_secret = "env:TGB_SALUT_WEBHOOK_SECRET"   # тот же, что в setWebhook
 # webhook_url = "https://client.example.com/tg/callback"
-# webhook_client = "salut66"
+# webhook_client = "myapp"
 
 # --- Клиенты: серверы фермы, которым разрешён доступ ---
 
 [[clients]]
-name = "salut66"                    # X-TgB-Client
+name = "myapp"                    # X-TgB-Client
 secret = "env:TGB_CLIENT_SALUT66_SECRET"
-allowed_ips = ["176.109.110.202/32"]   # опционально: пусто = любые IP
-bots = ["salut"]                    # какие алиасы доступны клиенту
+allowed_ips = ["203.0.113.10/32"]   # опционально: пусто = любые IP
+bots = ["mybot"]                    # какие алиасы доступны клиенту
 # allow_passthrough = false         # запретить /v1/t/* (только именованные действия)
 methods_allowlist = [               # опционально: пусто/отсутствие = любые методы
   "getMe",
@@ -49,7 +49,7 @@ methods_allowlist = [               # опционально: пусто/отс�
 [[clients]]
 name = "homepc"
 secret = "env:TGB_CLIENT_HOMEPC_SECRET"
-bots = ["salut"]
+bots = ["mybot"]
 
 # --- Действия: POST /v1/a/{name} ---
 # Клиент шлёт семантический JSON, мост рендерит params подстановкой
@@ -57,8 +57,8 @@ bots = ["salut"]
 
 [[actions]]
 name = "notify_admins"
-client = "salut66"            # кто может вызывать
-bot = "salut"
+client = "myapp"            # кто может вызывать
+bot = "mybot"
 method = "sendMessage"
 
 [actions.params]

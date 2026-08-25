@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tg Bridge test client ("botik").
+"""Tg Bridge test client ("demo bot").
 
 Runs on any host without direct Telegram access (e.g. behind RU blocking).
 Sends demo events to the admin chat through the bridge and answers admin's
@@ -9,9 +9,9 @@ Stdlib only, Python 3.8+.
 
 Environment (usually an env file read by the systemd unit):
     TGB_URL       http://bridge-host:8080
-    TGB_CLIENT    client name registered on the bridge (e.g. salut66)
+    TGB_CLIENT    client name registered on the bridge (e.g. myapp)
     TGB_SECRET    shared HMAC secret for this client
-    BOT_ALIAS     bot alias on the bridge (e.g. salut)
+    BOT_ALIAS     bot alias on the bridge (e.g. mybot)
     ADMIN_TG_ID   telegram user id allowed to talk to the bot
 """
 
@@ -26,7 +26,7 @@ import urllib.request
 
 POLL_TIMEOUT = 25        # seconds, getUpdates long-poll
 HTTP_TIMEOUT = POLL_TIMEOUT + 10
-HEARTBEAT_SECS = int(os.environ.get("BOTIK_HEARTBEAT_SECS", "3600"))
+HEARTBEAT_SECS = int(os.environ.get("DEMO_HEARTBEAT_SECS", "3600"))
 
 
 class BridgeClient:
@@ -112,7 +112,7 @@ def main() -> int:
             return "commands: /ping /status /help; anything else gets echoed"
         return f"echo: {text}"
 
-    send(f"botik started on this host, talking via bridge to @{bot_username}")
+    send(f"demo bot started on this host, talking via bridge to @{bot_username}")
 
     next_heartbeat = time.time() + HEARTBEAT_SECS
     while running["flag"]:
@@ -150,7 +150,7 @@ def main() -> int:
             log(f"loop error: {e}")
             time.sleep(5)
 
-    send("botik stopped")
+    send("demo bot stopped")
     return 0
 
 
