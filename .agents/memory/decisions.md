@@ -123,6 +123,18 @@ toml для [[actions]] работает (toml 1.1).
   дубль -> 401 tgb: replay detected, свежая подпись -> 200. Ботик работает
   (getUpdates 200 в журнале).
 
+## Релиз v1.0.0 (2026-08-25)
+
+- Все фичи плана реализованы: multipart passthrough (`max_upload_bytes`),
+  allow_passthrough per client, webhook-релей (ADR-6, /webhook/{alias}),
+  TLS-доки (deploy/Caddyfile.example, nginx.conf.example, DEPLOY.md §6).
+  Расхождение «ретраи read-only в proxy» убрано из доков (ретраит клиент).
+- 44 теста (12 unit + 32 integration), clippy чистый.
+- Тег v1.0.0, CHANGELOG.md. Протокол /v1/ заморожен.
+- de-01 передеплоен с multipart+webhook кодом, replay-smoke зелёный.
+- Осталось вне репо: публикация на GitHub, интеграция salut66.ru,
+  webhook на бою (setWebhook + endpoint клиента + TLS) — по мере надобности.
+
 ## План до релиза 1.0 (составлен 2026-08-25)
 
 Источники: README roadmap, PROTOCOL.md, ARCHITECTURE.md (ADR-4, компоненты),
