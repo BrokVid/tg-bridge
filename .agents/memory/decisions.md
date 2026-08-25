@@ -131,7 +131,8 @@ toml для [[actions]] работает (toml 1.1).
   Расхождение «ретраи read-only в proxy» убрано из доков (ретраит клиент).
 - 44 теста (12 unit + 32 integration), clippy чистый.
 - Тег v1.0.0, CHANGELOG.md. Протокол /v1/ заморожен.
-- de-01 передеплоен с multipart+webhook кодом, replay-smoke зелёный.
+- de-01 передеплоен: бинарник собран точно из тега v1.0.0, healthz отвечает
+  `version: 1.0.0`, replay-smoke с ru-01 зелёный.
 - Осталось вне репо: публикация на GitHub, интеграция salut66.ru,
   webhook на бою (setWebhook + endpoint клиента + TLS) — по мере надобности.
 
