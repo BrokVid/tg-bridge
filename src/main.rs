@@ -34,6 +34,8 @@ async fn main() -> anyhow::Result<()> {
     let state: SharedState = Arc::new(AppState {
         limiter: tg_bridge::ratelimit::RateLimiter::new(cfg.rate_limit.requests_per_minute),
         metrics: tg_bridge::metrics::Metrics::default(),
+        // TTL covers the whole acceptance window with margin
+        nonces: tg_bridge::nonce::NonceCache::new(cfg.server.timestamp_window_secs * 2 + 5),
         http,
         cfg,
     });

@@ -15,10 +15,12 @@ pub mod actions;
 pub mod auth;
 pub mod config;
 pub mod metrics;
+pub mod nonce;
 pub mod proxy;
 pub mod ratelimit;
 
 use metrics::Metrics;
+use nonce::NonceCache;
 use ratelimit::RateLimiter;
 
 pub struct AppState {
@@ -26,6 +28,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub limiter: RateLimiter,
     pub metrics: Metrics,
+    /// replay protection over (client, signature) pairs; see nonce.rs
+    pub nonces: NonceCache,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -108,14 +112,15 @@ fn authenticate_basic(
 }
 
 /// Full auth: basic checks + timestamp window + constant-time HMAC over
-/// `{timestamp}\n{body}`.
+/// `{timestamp}\n{body}`. Returns the client name, client config and the
+/// signature (the caller needs it for the replay check, see [check_replay]).
 #[allow(clippy::result_large_err)]
 fn authenticate_body(
     st: &AppState,
     headers: &HeaderMap,
     ip: std::net::IpAddr,
     body: &[u8],
-) -> Result<(String, config::Client), Response> {
+) -> Result<(String, config::Client, String), Response> {
     let (client_name, client) = authenticate_basic(st, headers, ip)?;
     let ts = header_str(headers, "x-tgb-timestamp")
         .and_then(|s| s.parse::<i64>().ok())
@@ -133,7 +138,23 @@ fn authenticate_body(
         tracing::warn!(client = %client_name, "bad signature");
         return Err(tgb_error(StatusCode::UNAUTHORIZED, "bad signature"));
     }
-    Ok((client_name, client))
+    Ok((client_name, client, signature))
+}
+
+/// Rejects a (client, signature) pair already served within the TTL. Must run
+/// after the rate limiter so a 429 never burns the request's slot in the
+/// cache. `None` = allowed (or protection disabled).
+fn check_replay(st: &AppState, client_name: &str, signature: &str) -> Option<Response> {
+    if !st.cfg.server.replay_protection {
+        return None;
+    }
+    let key = format!("{client_name}:{signature}");
+    if st.nonces.insert_if_absent(&key, now_secs()) {
+        None
+    } else {
+        tracing::warn!(client = %client_name, "replay detected");
+        Some(tgb_error(StatusCode::UNAUTHORIZED, "replay detected"))
+    }
 }
 
 /// Path segments must be conservative identifiers: they are interpolated into
@@ -205,13 +226,17 @@ async fn passthrough_impl(
     if !valid_alias_segment(&alias) || !valid_method_segment(&method) {
         return tgb_error(StatusCode::BAD_REQUEST, "invalid alias or method");
     }
-    let (client_name, client) = match authenticate_body(st, headers, addr.ip(), &body) {
+    let (client_name, client, signature) = match authenticate_body(st, headers, addr.ip(), &body)
+    {
         Ok(v) => v,
         Err(r) => return r,
     };
     if !st.limiter.allow(&client_name) {
         st.metrics.record_request(&client_name, kind, 429, 0);
         return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+    if let Some(r) = check_replay(st, &client_name, &signature) {
+        return r;
     }
 
     let result = resolve_bot_and_check_method(st, &client, &alias, &method);
@@ -298,13 +323,17 @@ async fn action_impl(
     if !valid_method_segment(&name) {
         return tgb_error(StatusCode::BAD_REQUEST, "invalid action name");
     }
-    let (client_name, _client) = match authenticate_body(st, headers, addr.ip(), &body) {
+    let (client_name, _client, signature) = match authenticate_body(st, headers, addr.ip(), &body)
+    {
         Ok(v) => v,
         Err(r) => return r,
     };
     if !st.limiter.allow(&client_name) {
         st.metrics.record_request(&client_name, kind, 429, 0);
         return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+    if let Some(r) = check_replay(st, &client_name, &signature) {
+        return r;
     }
 
     let Some(spec) = st.cfg.actions.get(&name).cloned() else {
@@ -398,6 +427,10 @@ async fn metrics_endpoint(
     }
     if !st.limiter.allow("metrics") {
         return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+    let signature = header_str(&headers, "x-tgb-signature").unwrap_or_default();
+    if let Some(r) = check_replay(&st, "metrics", &signature) {
+        return r;
     }
     let text = st.metrics.render();
     (

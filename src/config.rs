@@ -55,6 +55,8 @@ struct ServerToml {
     request_timeout_secs: u64,
     #[serde(default = "d_ts_window")]
     timestamp_window_secs: i64,
+    #[serde(default = "d_true")]
+    replay_protection: bool,
 }
 
 fn d_max_body() -> usize {
@@ -128,6 +130,8 @@ pub struct Server {
     pub max_body_bytes: usize,
     pub request_timeout: Duration,
     pub timestamp_window_secs: i64,
+    /// reject a (client, signature) pair already served within 2x window
+    pub replay_protection: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +305,7 @@ pub fn load(path: &str) -> Result<Config> {
             max_body_bytes: t.server.max_body_bytes,
             request_timeout: Duration::from_secs(t.server.request_timeout_secs),
             timestamp_window_secs: t.server.timestamp_window_secs,
+            replay_protection: t.server.replay_protection,
         },
         telegram: Telegram {
             api_base: t

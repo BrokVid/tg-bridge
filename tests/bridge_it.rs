@@ -29,6 +29,7 @@ fn test_config(api_base: String) -> Config {
             max_body_bytes: 65536,
             request_timeout: Duration::from_secs(5),
             timestamp_window_secs: 60,
+            replay_protection: true,
         },
         telegram: Telegram { api_base },
         rate_limit: RateLimit {
@@ -90,6 +91,7 @@ fn test_state(api_base: String) -> SharedState {
         http: reqwest::Client::new(),
         limiter: tg_bridge::ratelimit::RateLimiter::new(3),
         metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
     })
 }
 
@@ -223,11 +225,11 @@ async fn rate_limit_blocks_burst() {
     let (api_base, _last) = fake_telegram().await;
     let state = test_state(api_base);
     let router = tg_bridge::build_router(state.clone());
-    for _ in 0..3 {
+    for i in 0..3 {
         let r = send(
             router.clone(),
             "/v1/t/salut/getMe",
-            "{\"a\":1}",
+            &format!("{{\"a\":{i}}}"),
             0,
             SECRET.as_bytes(),
             None,
@@ -236,7 +238,7 @@ async fn rate_limit_blocks_burst() {
         assert_eq!(r.0, StatusCode::OK);
     }
     let (status, body) =
-        send(router, "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+        send(router, "/v1/t/salut/getMe", "{\"a\":3}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["description"], json!("tgb: rate limited"));
 }
@@ -342,6 +344,7 @@ async fn oversized_body_rejected() {
     let router = tg_bridge::build_router(Arc::new(AppState {
         limiter: tg_bridge::ratelimit::RateLimiter::new(100),
         metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
         http: reqwest::Client::new(),
         cfg: cfg_over,
     }));
@@ -362,6 +365,7 @@ async fn action_oversized_text_is_400_not_telegram_error() {
     let state: SharedState = Arc::new(AppState {
         limiter: tg_bridge::ratelimit::RateLimiter::new(100),
         metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
         http: reqwest::Client::new(),
         cfg,
     });
@@ -415,10 +419,68 @@ async fn bot_not_allowed_for_client_is_403() {
     let state: SharedState = Arc::new(AppState {
         limiter: tg_bridge::ratelimit::RateLimiter::new(100),
         metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
         http: reqwest::Client::new(),
         cfg,
     });
     let router = tg_bridge::build_router(state);
     let (status, _) = send(router, "/v1/t/other/getMe", "{}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------- replay protection ----------
+
+#[tokio::test]
+async fn duplicate_signed_request_rejected_as_replay() {
+    let (api_base, last) = fake_telegram().await;
+    let state = test_state(api_base);
+    let router = tg_bridge::build_router(state.clone());
+    let (status, _) =
+        send(router.clone(), "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // byte-identical request within the window is a replay
+    let (status, body) =
+        send(router, "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["description"], json!("tgb: replay detected"));
+    assert_eq!(last.lock().unwrap().iter().count(), 1, "upstream hit once");
+}
+
+#[tokio::test]
+async fn same_body_new_timestamp_is_not_replay() {
+    let (api_base, _last) = fake_telegram().await;
+    let router = tg_bridge::build_router(test_state(api_base));
+    for ts_offset in [0, -1] {
+        let (status, _) = send(
+            router.clone(),
+            "/v1/t/salut/getMe",
+            "{\"a\":1}",
+            ts_offset,
+            SECRET.as_bytes(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "ts_offset={ts_offset}");
+    }
+}
+
+#[tokio::test]
+async fn replay_check_disabled_when_configured_off() {
+    let (api_base, _last) = fake_telegram().await;
+    let mut cfg = test_config(api_base);
+    cfg.server.replay_protection = false;
+    let state: SharedState = Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
+        http: reqwest::Client::new(),
+        cfg,
+    });
+    let router = tg_bridge::build_router(state);
+    for _ in 0..2 {
+        let (status, _) =
+            send(router.clone(), "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
 }
