@@ -1,0 +1,32 @@
+# TLS-фронт для Tg Bridge (nginx, пример)
+# Сертификаты: certbot --nginx -d bridge.example.com
+# Мост слушает 127.0.0.1:8080; наружу только 443.
+
+server {
+    listen 443 ssl http2;
+    server_name bridge.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/bridge.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bridge.example.com/privkey.pem;
+
+    # Современные протоколы только
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+
+        # long-poll getUpdates держит соединение ~25 c
+        proxy_read_timeout 60s;
+
+        # запас на multipart-загрузку файлов через мост
+        client_max_body_size 64m;
+    }
+}
+
+server {
+    listen 80;
+    server_name bridge.example.com;
+    return 301 https://$host$request_uri;
+}
