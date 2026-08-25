@@ -51,6 +51,8 @@ struct ServerToml {
     listen: String,
     #[serde(default = "d_max_body")]
     max_body_bytes: usize,
+    #[serde(default = "d_max_upload")]
+    max_upload_bytes: usize,
     #[serde(default = "d_req_timeout")]
     request_timeout_secs: u64,
     #[serde(default = "d_ts_window")]
@@ -61,6 +63,10 @@ struct ServerToml {
 
 fn d_max_body() -> usize {
     65536
+}
+/// Bot API upload limit is ~50 MB per file
+fn d_max_upload() -> usize {
+    52_428_800
 }
 fn d_req_timeout() -> u64 {
     35
@@ -92,6 +98,8 @@ struct ClientToml {
     allowed_ips: Vec<String>,
     #[serde(default)]
     bots: Vec<String>,
+    #[serde(default = "d_true")]
+    allow_passthrough: bool,
     #[serde(default)]
     methods_allowlist: Vec<String>,
 }
@@ -128,6 +136,8 @@ impl SecretRef {
 pub struct Server {
     pub listen: String,
     pub max_body_bytes: usize,
+    /// limit for multipart/form-data uploads (file sending)
+    pub max_upload_bytes: usize,
     pub request_timeout: Duration,
     pub timestamp_window_secs: i64,
     /// reject a (client, signature) pair already served within 2x window
@@ -149,6 +159,8 @@ pub struct Client {
     pub secret: String,
     pub allowed_ips: Vec<ipnet::IpNet>,
     pub bots: Vec<String>,
+    /// false = client may only call named actions (/v1/a/*), no raw passthrough
+    pub allow_passthrough: bool,
     pub methods_allowlist: Option<Vec<String>>,
 }
 
@@ -259,6 +271,7 @@ pub fn load(path: &str) -> Result<Config> {
                     secret: spec.secret.resolve()?,
                     allowed_ips: nets,
                     bots: spec.bots.clone(),
+                    allow_passthrough: spec.allow_passthrough,
                     methods_allowlist: if spec.methods_allowlist.is_empty() {
                         None
                     } else {
@@ -303,6 +316,7 @@ pub fn load(path: &str) -> Result<Config> {
         server: Server {
             listen: t.server.listen.clone(),
             max_body_bytes: t.server.max_body_bytes,
+            max_upload_bytes: t.server.max_upload_bytes,
             request_timeout: Duration::from_secs(t.server.request_timeout_secs),
             timestamp_window_secs: t.server.timestamp_window_secs,
             replay_protection: t.server.replay_protection,

@@ -97,6 +97,6 @@ mod tests {
         }
         let g = c.lock();
         assert!(g.seen.len() <= MAX_ENTRIES);
-        assert!(g.seen.len() > 0);
+        assert!(!g.seen.is_empty());
     }
 }

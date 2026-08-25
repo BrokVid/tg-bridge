@@ -27,6 +27,7 @@ fn test_config(api_base: String) -> Config {
         server: Server {
             listen: "127.0.0.1:0".into(),
             max_body_bytes: 65536,
+            max_upload_bytes: 1024 * 1024,
             request_timeout: Duration::from_secs(5),
             timestamp_window_secs: 60,
             replay_protection: true,
@@ -43,7 +44,12 @@ fn test_config(api_base: String) -> Config {
                 secret: SECRET.into(),
                 allowed_ips: vec![],
                 bots: vec!["salut".into()],
-                methods_allowlist: Some(vec!["getMe".into(), "sendMessage".into()]),
+                allow_passthrough: true,
+                methods_allowlist: Some(vec![
+                    "getMe".into(),
+                    "sendMessage".into(),
+                    "sendDocument".into(),
+                ]),
             },
         )]),
         actions: HashMap::from([(
@@ -62,17 +68,35 @@ fn test_config(api_base: String) -> Config {
     }
 }
 
-/// Spawns a fake api.telegram.org that records the last request body.
-async fn fake_telegram() -> (String, Arc<std::sync::Mutex<Option<serde_json::Value>>>) {
+/// Fake api.telegram.org handle: parsed JSON of the last request plus the
+/// raw bytes/content-type (for multipart passthrough checks).
+type RawCapture = Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
+
+struct FakeTg {
+    api_base: String,
+    last: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    raw: RawCapture,
+}
+
+async fn fake_telegram() -> FakeTg {
     let last = Arc::new(std::sync::Mutex::new(None));
+    let raw = Arc::new(std::sync::Mutex::new(None));
     let last_clone = last.clone();
+    let raw_clone = raw.clone();
     let app = axum::Router::new().route(
         "/bot123456:FAKE-TOKEN/{method}",
         axum::routing::post(
             |axum::extract::Path(method): axum::extract::Path<String>,
+             headers: axum::http::HeaderMap,
              body: axum::body::Bytes| async move {
-                *last_clone.lock().unwrap() =
-                    Some(serde_json::from_slice(&body).unwrap());
+                let ct = headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                *raw_clone.lock().unwrap() = Some((ct, body.to_vec()));
+                let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                *last_clone.lock().unwrap() = Some(value);
                 axum::Json(json!({"ok": true, "result": {"method": method}}))
             },
         ),
@@ -82,7 +106,11 @@ async fn fake_telegram() -> (String, Arc<std::sync::Mutex<Option<serde_json::Val
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{addr}"), last)
+    FakeTg {
+        api_base: format!("http://{addr}"),
+        last,
+        raw,
+    }
 }
 
 fn test_state(api_base: String) -> SharedState {
@@ -103,30 +131,47 @@ async fn send(
     secret: &[u8],
     sig_override: Option<String>,
 ) -> (StatusCode, serde_json::Value) {
+    send_bytes(
+        router,
+        method_path,
+        body.as_bytes().to_vec(),
+        ts_offset,
+        secret,
+        sig_override,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_bytes(
+    router: axum::Router,
+    method_path: &str,
+    body: Vec<u8>,
+    ts_offset: i64,
+    secret: &[u8],
+    sig_override: Option<String>,
+    content_type: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let ts_val = tg_bridge::now_secs() + ts_offset;
     let req = Request::builder()
         .method("POST")
         .uri(format!("http://bridge.test{method_path}"))
-        .header("content-type", "application/json")
+        .header("content-type", content_type.unwrap_or("application/json"))
         .header("x-tgb-client", CLIENT)
-        .header(
-            "x-tgb-timestamp",
-            (tg_bridge::now_secs() + ts_offset).to_string(),
-        )
+        .header("x-tgb-timestamp", ts_val.to_string())
         .header(
             "x-tgb-signature",
-            sig_override.unwrap_or_else(|| sign_hex(secret, tg_bridge::now_secs() + ts_offset, body.as_bytes())),
+            sig_override.unwrap_or_else(|| sign_hex(secret, ts_val, &body)),
         )
         .extension(ConnectInfo("127.0.0.1:55555".parse::<SocketAddr>().unwrap()))
-        .body(Body::from(body.to_owned()))
+        .body(Body::from(body))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let value = if bytes.is_empty() {
-        json!(null)
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
+    // axum's own body-limit rejection returns an empty/non-JSON body
+    let value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
     (status, value)
 }
 
@@ -171,9 +216,10 @@ async fn stale_timestamp_rejected() {
 
 #[tokio::test]
 async fn passthrough_forwards_to_telegram() {
-    let (api_base, _last) = fake_telegram().await;
-    let router = tg_bridge::build_router(test_state(api_base));
-    let (status, body) = send(router, "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
+    let tg = fake_telegram().await;
+    let router = tg_bridge::build_router(test_state(tg.api_base.clone()));
+    let (status, body) =
+        send(router, "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["result"]["method"], json!("getMe"));
@@ -191,15 +237,15 @@ async fn disallowed_method_rejected() {
 
 #[tokio::test]
 async fn action_renders_template_and_calls_telegram() {
-    let (api_base, last) = fake_telegram().await;
-    let router = tg_bridge::build_router(test_state(api_base));
+    let tg = fake_telegram().await;
+    let router = tg_bridge::build_router(test_state(tg.api_base.clone()));
     let payload = json!({"level": "warn", "text": "disk 91%"}).to_string();
     let (status, body) =
         send(router, "/v1/a/notify", &payload, 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["telegram_ok"], json!(true));
-    let sent = last.lock().unwrap().clone().unwrap();
+    let sent = tg.last.lock().unwrap().clone().unwrap();
     assert_eq!(sent["chat_id"], json!(-100123));
     assert_eq!(sent["text"], json!("[warn] disk 91%"));
 }
@@ -222,8 +268,8 @@ async fn unknown_action_is_404() {
 
 #[tokio::test]
 async fn rate_limit_blocks_burst() {
-    let (api_base, _last) = fake_telegram().await;
-    let state = test_state(api_base);
+    let tg = fake_telegram().await;
+    let state = test_state(tg.api_base);
     let router = tg_bridge::build_router(state.clone());
     for i in 0..3 {
         let r = send(
@@ -245,8 +291,8 @@ async fn rate_limit_blocks_burst() {
 
 #[tokio::test]
 async fn metrics_exposes_counters() {
-    let (api_base, _last) = fake_telegram().await;
-    let state = test_state(api_base);
+    let tg = fake_telegram().await;
+    let state = test_state(tg.api_base);
     let router = tg_bridge::build_router(state.clone());
     let _ = send(router.clone(), "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
 
@@ -357,8 +403,8 @@ async fn oversized_body_rejected() {
 #[tokio::test]
 async fn action_oversized_text_is_400_not_telegram_error() {
     // action template renders client text; >4096 chars must be rejected by the bridge
-    let (api_base, last) = fake_telegram().await;
-    let mut cfg = test_config(api_base);
+    let tg = fake_telegram().await;
+    let mut cfg = test_config(tg.api_base);
     if let Some(a) = cfg.actions.get_mut("notify") {
         a.params["text"] = json!("{{text}}");
     }
@@ -378,7 +424,99 @@ async fn action_oversized_text_is_400_not_telegram_error() {
         body["description"],
         json!("tgb: text exceeds Telegram limit of 4096 characters")
     );
-    assert!(last.lock().unwrap().is_none(), "nothing must reach upstream");
+    assert!(tg.last.lock().unwrap().is_none(), "nothing must reach upstream");
+}
+
+// ---------- multipart uploads ----------
+
+#[tokio::test]
+async fn multipart_upload_forwarded_verbatim() {
+    let tg = fake_telegram().await;
+    let router = tg_bridge::build_router(test_state(tg.api_base));
+
+    let boundary = "tgbtestboundary123";
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\nsmoke file\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // binary payload
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let ct = format!("multipart/form-data; boundary={boundary}");
+
+    let (status, resp) = send_bytes(
+        router,
+        "/v1/t/salut/sendDocument",
+        body.clone(),
+        0,
+        SECRET.as_bytes(),
+        None,
+        Some(&ct),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resp={resp}");
+
+    let raw = tg.raw.lock().unwrap().clone().expect("upstream saw request");
+    assert_eq!(raw.0, ct, "content-type with boundary forwarded verbatim");
+    assert_eq!(raw.1, body, "multipart bytes forwarded verbatim");
+}
+
+#[tokio::test]
+async fn oversized_upload_rejected_before_upstream() {
+    let tg = fake_telegram().await;
+    let mut cfg = test_config(tg.api_base.clone());
+    cfg.server.max_upload_bytes = 16;
+    let state: SharedState = Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
+        http: reqwest::Client::new(),
+        cfg,
+    });
+    let router = tg_bridge::build_router(state);
+    let big_body = vec![b'x'; 64];
+    let (status, _resp) = send_bytes(
+        router,
+        "/v1/t/salut/sendDocument",
+        big_body,
+        0,
+        SECRET.as_bytes(),
+        None,
+        Some("multipart/form-data; boundary=b"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    // rejected before the handler (axum body limit) or by the bridge itself;
+    // either way nothing reaches upstream
+    assert!(tg.raw.lock().unwrap().is_none(), "nothing must reach upstream");
+}
+
+#[tokio::test]
+async fn json_over_upload_limit_but_under_json_limit_is_ok() {
+    // JSON limit is separate from upload limit: a JSON body larger than
+    // max_body_bytes stays limited by max_body_bytes even though the route
+    // allows bigger multipart bodies.
+    let tg = fake_telegram().await;
+    let mut cfg = test_config(tg.api_base);
+    cfg.server.max_body_bytes = 8;
+    let state: SharedState = Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
+        http: reqwest::Client::new(),
+        cfg,
+    });
+    let router = tg_bridge::build_router(state);
+    let (status, _) = send(router, "/v1/t/salut/getMe", "{\"a\":\"123456789\"}", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
@@ -428,12 +566,53 @@ async fn bot_not_allowed_for_client_is_403() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+// ---------- per-client passthrough switch ----------
+
+#[tokio::test]
+async fn passthrough_denied_when_disabled_for_client() {
+    let mut cfg = test_config("http://127.0.0.1:1".into());
+    cfg.clients.get_mut(CLIENT).unwrap().allow_passthrough = false;
+    let state: SharedState = Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
+        http: reqwest::Client::new(),
+        cfg,
+    });
+    let router = tg_bridge::build_router(state);
+    let (status, body) =
+        send(router, "/v1/t/salut/getMe", "{}", 0, SECRET.as_bytes(), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["description"], json!("tgb: passthrough not allowed for client"));
+}
+
+#[tokio::test]
+async fn action_still_allowed_when_passthrough_disabled() {
+    let mut cfg = test_config("http://127.0.0.1:1".into());
+    cfg.clients.get_mut(CLIENT).unwrap().allow_passthrough = false;
+    let state: SharedState = Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
+        http: reqwest::Client::new(),
+        cfg,
+    });
+    let router = tg_bridge::build_router(state);
+    // unknown action is 404 (routing works); the point is it's not 403-passthrough
+    let (status, _) = send(router, "/v1/a/notify", "{\"text\":\"x\"}", 0, SECRET.as_bytes(), None).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "action must not be blocked by allow_passthrough=false"
+    );
+}
+
 // ---------- replay protection ----------
 
 #[tokio::test]
 async fn duplicate_signed_request_rejected_as_replay() {
-    let (api_base, last) = fake_telegram().await;
-    let state = test_state(api_base);
+    let tg = fake_telegram().await;
+    let state = test_state(tg.api_base);
     let router = tg_bridge::build_router(state.clone());
     let (status, _) =
         send(router.clone(), "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
@@ -444,13 +623,13 @@ async fn duplicate_signed_request_rejected_as_replay() {
         send(router, "/v1/t/salut/getMe", "{\"a\":1}", 0, SECRET.as_bytes(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["description"], json!("tgb: replay detected"));
-    assert_eq!(last.lock().unwrap().iter().count(), 1, "upstream hit once");
+    assert_eq!(tg.last.lock().unwrap().iter().count(), 1, "upstream hit once");
 }
 
 #[tokio::test]
 async fn same_body_new_timestamp_is_not_replay() {
-    let (api_base, _last) = fake_telegram().await;
-    let router = tg_bridge::build_router(test_state(api_base));
+    let tg = fake_telegram().await;
+    let router = tg_bridge::build_router(test_state(tg.api_base));
     for ts_offset in [0, -1] {
         let (status, _) = send(
             router.clone(),
@@ -467,8 +646,8 @@ async fn same_body_new_timestamp_is_not_replay() {
 
 #[tokio::test]
 async fn replay_check_disabled_when_configured_off() {
-    let (api_base, _last) = fake_telegram().await;
-    let mut cfg = test_config(api_base);
+    let tg = fake_telegram().await;
+    let mut cfg = test_config(tg.api_base);
     cfg.server.replay_protection = false;
     let state: SharedState = Arc::new(AppState {
         limiter: tg_bridge::ratelimit::RateLimiter::new(100),

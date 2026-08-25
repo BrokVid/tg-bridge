@@ -8,7 +8,8 @@
 
 - Транспорт: HTTP/1.1 или HTTP/2. Размещение — приватная сеть (Tailscale,
   WireGuard) или TLS-фронт (nginx/caddy). Голый HTTP наружу не предназначен.
-- Кодировка тела: JSON (UTF-8), `Content-Type: application/json`.
+- Тело запроса: JSON (`Content-Type: application/json`) для обычных вызовов
+  либо `multipart/form-data` для отправки файлов через passthrough.
 - Все ответы моста — дословный ответ Telegram Bot API (тот же статус-код и
   тело), либо собственная ошибка моста в формате ниже.
 
@@ -84,6 +85,12 @@
 возвращает ответ Telegram без изменений (включая `429 Too Many Requests`
 и поле `retry_after` — клиент сам решает, повторять ли).
 
+**Файлы**: тело с `Content-Type: multipart/form-data` пересылается дословно
+(байты и заголовок Content-Type с boundary сохраняются) — так работают
+sendPhoto, sendDocument и прочие загрузки. Подпись считается по сырым байтам
+тела так же, как для JSON. На multipart действует отдельный лимит размера
+(`max_upload_bytes`, по умолчанию ~50 МБ — лимит Bot API на файл).
+
 ### POST /v1/a/{action}  — именованное действие
 
 Шаблон действия задаётся в конфиге моста (глобальный массив `[[actions]]`,
@@ -118,6 +125,7 @@ Prometheus text format, защищён той же HMAC-подписью (заг
 | Параметр | Значение | Источник |
 |---|---|---|
 | макс. тело запроса к мосту | 64 КБ (по умолчанию) | конфиг моста |
+| макс. multipart-загрузка | ~50 МБ (по умолчанию) | конфиг моста + Bot API |
 | окно timestamp | ±60 c | конфиг моста |
 | окно replay-кэша | 2×окно + 5 c | производная от окна timestamp |
 | rate limit | per client, напр. 120 req/min burst 20 | конфиг моста |
@@ -161,7 +169,9 @@ Prometheus text format, защищён той же HMAC-подписью (заг
   друга); offset = последний `update_id` + 1; обновления хранятся ≤ 24 ч.
 - Ответ Telegram всегда содержит `ok`; при ошибке — `description`,
   `error_code` и опционально `parameters.retry_after`.
-- Файлы (multipart) через мост не передаются — только JSON-методы.
+- Файлы отправляются multipart-запросом через passthrough; лимит загрузки
+  бота — ~50 МБ на файл. Скачивание файлов (getFile → file_path) клиент
+  делает напрямую с api.telegram.org по HTTPS.
 
 ## Версионирование
 

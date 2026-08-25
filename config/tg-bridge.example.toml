@@ -31,6 +31,7 @@ name = "salut66"                    # X-TgB-Client
 secret = "env:TGB_CLIENT_SALUT66_SECRET"
 allowed_ips = ["176.109.110.202/32"]   # опционально: пусто = любые IP
 bots = ["salut"]                    # какие алиасы доступны клиенту
+# allow_passthrough = false         # запретить /v1/t/* (только именованные действия)
 methods_allowlist = [               # опционально: пусто/отсутствие = любые методы
   "getMe",
   "sendMessage",

@@ -59,10 +59,14 @@ async fn healthz() -> Json<serde_json::Value> {
 
 pub fn build_router(state: SharedState) -> Router {
     let metrics_enabled = state.cfg.metrics.enabled;
+    // uploads need more room than the default extractor limit; JSON routes
+    // still enforce their own smaller max_body_bytes manually
+    let upload_limit = state.cfg.server.max_upload_bytes;
     let base = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/t/{alias}/{method}", post(passthrough))
-        .route("/v1/a/{name}", post(action));
+        .route("/v1/a/{name}", post(action))
+        .layer(axum::extract::DefaultBodyLimit::max(upload_limit));
     if metrics_enabled {
         base.route("/metrics", get(metrics_endpoint)).with_state(state)
     } else {
@@ -208,7 +212,8 @@ async fn passthrough(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: axum::body::Bytes,
 ) -> Response {
-    passthrough_impl(&st, alias, method, &headers, addr, body).await
+    let content_type = header_str(&headers, "content-type");
+    passthrough_impl(&st, alias, method, &headers, addr.ip(), content_type, body).await
 }
 
 async fn passthrough_impl(
@@ -216,21 +221,35 @@ async fn passthrough_impl(
     alias: String,
     method: String,
     headers: &HeaderMap,
-    addr: SocketAddr,
+    addr: std::net::IpAddr,
+    content_type: Option<String>,
     body: axum::body::Bytes,
 ) -> Response {
     let kind = "passthrough";
-    if body.len() > st.cfg.server.max_body_bytes {
+    // multipart/form-data is a file upload (Bot API ~50 MB); JSON is a normal call
+    let is_upload = content_type
+        .as_deref()
+        .is_some_and(|c| c.to_ascii_lowercase().starts_with("multipart/form-data"));
+    let limit = if is_upload {
+        st.cfg.server.max_upload_bytes
+    } else {
+        st.cfg.server.max_body_bytes
+    };
+    if body.len() > limit {
         return tgb_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
     }
     if !valid_alias_segment(&alias) || !valid_method_segment(&method) {
         return tgb_error(StatusCode::BAD_REQUEST, "invalid alias or method");
     }
-    let (client_name, client, signature) = match authenticate_body(st, headers, addr.ip(), &body)
-    {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (client_name, client, signature) =
+        match authenticate_body(st, headers, addr, &body) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+    if !client.allow_passthrough {
+        tracing::warn!(client = %client_name, "passthrough disabled for client");
+        return tgb_error(StatusCode::FORBIDDEN, "passthrough not allowed for client");
+    }
     if !st.limiter.allow(&client_name) {
         st.metrics.record_request(&client_name, kind, 429, 0);
         return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
@@ -252,6 +271,7 @@ async fn passthrough_impl(
         &token,
         &alias,
         &method,
+        content_type,
         body,
     )
     .await;
@@ -323,11 +343,11 @@ async fn action_impl(
     if !valid_method_segment(&name) {
         return tgb_error(StatusCode::BAD_REQUEST, "invalid action name");
     }
-    let (client_name, _client, signature) = match authenticate_body(st, headers, addr.ip(), &body)
-    {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (client_name, _client, signature) =
+        match authenticate_body(st, headers, addr.ip(), &body) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
     if !st.limiter.allow(&client_name) {
         st.metrics.record_request(&client_name, kind, 429, 0);
         return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
