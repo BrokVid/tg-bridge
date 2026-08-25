@@ -113,6 +113,31 @@ sendPhoto, sendDocument и прочие загрузки. Подпись счи�
 Неизвестное действие — 404; действие чужого клиента — 403;
 ошибка рендера — 400.
 
+### POST /webhook/{alias} — приём апдейтов от Telegram
+
+Обратный режим: сам Telegram пушит обновления на мост, мост пересылает их
+клиенту. Аутентификация — не по клиентскому HMAC, а по заголовку
+`X-Telegram-Bot-Api-Secret-Token`, который Telegram подписывает секретом,
+заданным при setWebhook (сравнение constant-time).
+
+Конфиг бота (все три ключа вместе или ни одного):
+
+```toml
+[bots.salut]
+token = "..."
+webhook_secret = "env:TGB_SALUT_WEBHOOK_SECRET"
+webhook_url = "https://client.example/tg/callback"   # куда доставлять
+webhook_client = "salut66"                            # чьим секретом подписать
+```
+
+Доставка клиенту подписана тем же HMAC-протоколом (`X-TgB-Timestamp`,
+`X-TgB-Signature` над `{timestamp}\n{body}` секретом клиента) — клиент
+проверяет её тем же кодом, каким мост проверяет входящие запросы.
+
+Очередей нет: недоставленный апдейт (сеть/5xx от клиента) отвечает мосту
+от Telegram 502 — и Telegram сам повторит позже. Ответ клиента (статус + тело)
+проходит обратно в Telegram дословно.
+
 ### GET /metrics
 
 Prometheus text format, защищён той же HMAC-подписью (заголовки как у

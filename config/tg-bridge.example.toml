@@ -23,6 +23,12 @@ enabled = true
 
 [bots.salut]
 token = "env:TGB_BOT_SALUT_TOKEN"
+# Webhook-релей: Telegram пушит апдейты на POST /webhook/salut, мост доставляет
+# их на webhook_url, подписав HMAC-секретом клиента webhook_client.
+# Все три ключа задаются вместе или не задаются вовсе:
+# webhook_secret = "env:TGB_SALUT_WEBHOOK_SECRET"   # тот же, что в setWebhook
+# webhook_url = "https://client.example.com/tg/callback"
+# webhook_client = "salut66"
 
 # --- Клиенты: серверы фермы, которым разрешён доступ ---
 

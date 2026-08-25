@@ -72,11 +72,21 @@ REST+HMAC: вызывается из `curl`, Python `requests` за 10 стро�
 Состояние не нужно: rate limit — in-memory скользящее окно, метрики — счётчики
 процесса. Перезапуск теряет только окно rate-limit'а, что безопасно.
 
+### ADR-6: Webhook-релей без очередей
+
+Telegram может пушить апдейты на `POST /webhook/{alias}`; мост проверяет
+`X-Telegram-Bot-Api-Secret-Token` (constant-time) и доставляет апдейт на URL
+клиента, подписанный HMAC-протоколом с секретом этого клиента — симметрично
+обычному направлению. Очередь сознательно не строится (stateless, ADR-5):
+недоставка = 502, и Telegram сам ретраит апдейты. Взаимоисключаемость
+getUpdates/webhook остаётся на совести оператора бота (стандартное поведение
+Bot API).
+
 ## 3. Компоненты
 
 | Компонент | Ответственность |
 |---|---|
-| `server` | axum-роутер: `/healthz`, `/metrics`, `/v1/t/:alias/:method`, `/v1/a/:name` |
+| `server` | axum-роутер: `/healthz`, `/metrics`, `/v1/t/:alias/:method`, `/v1/a/:name`, `/webhook/:alias` |
 | `auth` | проверка HMAC-подписи, timestamp-окна, IP allowlist |
 | `proxy` | пул соединений к api.telegram.org, таймауты. Без авторетраев: повторяет клиент (см. PROTOCOL.md «Идемпотентность и повторы») |
 | `actions` | рендер шаблонов действий из конфига |

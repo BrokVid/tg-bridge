@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
+use subtle::ConstantTimeEq;
 
 pub mod actions;
 pub mod auth;
@@ -66,6 +67,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/t/{alias}/{method}", post(passthrough))
         .route("/v1/a/{name}", post(action))
+        .route("/webhook/{alias}", post(telegram_webhook))
         .layer(axum::extract::DefaultBodyLimit::max(upload_limit));
     if metrics_enabled {
         base.route("/metrics", get(metrics_endpoint)).with_state(state)
@@ -305,7 +307,7 @@ fn resolve_bot_and_check_method(
     alias: &str,
     method: &str,
 ) -> Result<String, Response> {
-    let Some(token) = st.cfg.bots.get(alias) else {
+    let Some(bot) = st.cfg.bots.get(alias) else {
         return Err(tgb_error(StatusCode::NOT_FOUND, "unknown bot alias"));
     };
     if !client.bots.is_empty() && !client.bots.iter().any(|b| b == alias) {
@@ -316,7 +318,7 @@ fn resolve_bot_and_check_method(
             return Err(tgb_error(StatusCode::FORBIDDEN, "method not allowed for client"));
         }
     }
-    Ok(token.clone())
+    Ok(bot.token.clone())
 }
 
 async fn action(
@@ -396,14 +398,14 @@ async fn action_impl(
     {
         tracing::warn!(action = %name, "action chat_id is templated from client input");
     }
-    let token = &st.cfg.bots[&spec.bot];
+    let token = st.cfg.bots[&spec.bot].token.clone();
     let params_bytes = serde_json::to_vec(&params).expect("serializable");
 
     let started = std::time::Instant::now();
     match proxy::send_json(
         &st.http,
         &st.cfg.telegram.api_base,
-        token,
+        &token,
         &spec.bot,
         &spec.method,
         params_bytes,
@@ -458,4 +460,115 @@ async fn metrics_endpoint(
         text,
     )
         .into_response()
+}
+
+/// Telegram -> bridge push endpoint (ADR-6). Authenticated by the per-bot
+/// `X-Telegram-Bot-Api-Secret-Token` (set at setWebhook time), not by client
+/// HMAC. The update is relayed to the configured client URL signed with that
+/// client's secret using the same HMAC scheme clients already know. No
+/// queuing: a failed delivery returns 5xx so Telegram retries on its own.
+async fn telegram_webhook(
+    State(st): State<SharedState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    webhook_impl(&st, alias, &headers, body).await
+}
+
+#[allow(clippy::result_large_err)]
+fn webhook_target<'a>(
+    st: &'a AppState,
+    alias: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(&'a config::WebhookTarget, String), Response> {
+    if !valid_alias_segment(alias) {
+        return Err(tgb_error(StatusCode::BAD_REQUEST, "invalid bot alias"));
+    }
+    if body.len() > st.cfg.server.max_body_bytes {
+        return Err(tgb_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large"));
+    }
+    let Some(bot) = st.cfg.bots.get(alias) else {
+        return Err(tgb_error(StatusCode::NOT_FOUND, "unknown bot alias"));
+    };
+    let Some(target) = &bot.webhook else {
+        return Err(tgb_error(StatusCode::NOT_FOUND, "webhook not configured"));
+    };
+    let provided = header_str(headers, "x-telegram-bot-api-secret-token").unwrap_or_default();
+    let ok = provided.len() == target.secret.len()
+        && bool::from(provided.as_bytes().ct_eq(target.secret.as_bytes()));
+    if !ok {
+        tracing::warn!(bot = %alias, "webhook secret mismatch");
+        return Err(tgb_error(StatusCode::FORBIDDEN, "bad webhook secret"));
+    }
+    let Some(client_secret) = st.cfg.clients.get(&target.client).map(|c| c.secret.clone()) else {
+        tracing::error!(bot = %alias, client = %target.client, "webhook client vanished");
+        return Err(tgb_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "misconfigured webhook target",
+        ));
+    };
+    Ok((target, client_secret))
+}
+
+async fn webhook_impl(
+    st: &SharedState,
+    alias: String,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let kind = "webhook";
+    let (target, client_secret) = match webhook_target(st, &alias, headers, &body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !st.limiter.allow(&format!("webhook:{alias}")) {
+        st.metrics.record_request(&target.client, kind, 429, 0);
+        return tgb_error(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+
+    // sign the delivery exactly like client->bridge requests are signed, so a
+    // client can verify it with the same code path (mirrored direction)
+    let ts = now_secs();
+    let signature = auth::sign_hex(client_secret.as_bytes(), ts, &body);
+
+    let started = std::time::Instant::now();
+    let delivery = st
+        .http
+        .post(&target.url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("X-TgB-Timestamp", ts.to_string())
+        .header("X-TgB-Signature", signature)
+        .body(body.clone())
+        .send()
+        .await;
+    let ms = started.elapsed().as_millis() as u64;
+
+    match delivery {
+        Ok(resp) => {
+            let status = resp.status();
+            st.metrics.record_request(&target.client, kind, status.as_u16(), ms);
+            tracing::info!(
+                bot = %alias,
+                client = %target.client,
+                status = status.as_u16(),
+                ms,
+                "webhook delivered"
+            );
+            // pass the client's answer through so Telegram sees success/failure
+            let resp_status = axum::http::StatusCode::from_u16(status.as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            match resp.bytes().await {
+                Ok(bytes) => (resp_status, bytes).into_response(),
+                Err(_) => (resp_status, ()).into_response(),
+            }
+        }
+        Err(e) => {
+            st.metrics.record_upstream_error(kind);
+            tracing::error!(bot = %alias, client = %target.client, error = %e, "webhook delivery failed");
+            // non-2xx makes Telegram retry the update later
+            tgb_error(StatusCode::BAD_GATEWAY, "client unreachable")
+        }
+    }
 }

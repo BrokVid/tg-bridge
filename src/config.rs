@@ -6,12 +6,30 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
+pub struct Bot {
+    pub token: String,
+    /// when set, Telegram may push updates to POST /webhook/{alias} and the
+    /// bridge relays them signed to this client's endpoint
+    pub webhook: Option<WebhookTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebhookTarget {
+    /// shared secret sent by Telegram in X-Telegram-Bot-Api-Secret-Token
+    pub secret: String,
+    /// client-side endpoint that receives the update
+    pub url: String,
+    /// whose secret signs the delivery
+    pub client: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub server: Server,
     pub telegram: Telegram,
     pub rate_limit: RateLimit,
     pub metrics: Metrics,
-    pub bots: HashMap<String, String>,
+    pub bots: HashMap<String, Bot>,
     pub clients: HashMap<String, Client>,
     pub actions: HashMap<String, Action>,
 }
@@ -88,6 +106,11 @@ struct RateLimitToml {
 #[derive(Debug, Clone, Deserialize)]
 struct BotToml {
     token: SecretRef,
+    /// optional webhook relay: presence of any key enables POST /webhook/{alias};
+    /// all three must be given together
+    webhook_secret: Option<SecretRef>,
+    webhook_url: Option<String>,
+    webhook_client: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -251,9 +274,39 @@ pub fn load(path: &str) -> Result<Config> {
     let t: ConfigToml =
         toml::from_str(&raw).with_context(|| format!("bad config {path}"))?;
 
+    let clients_names: std::collections::HashSet<String> =
+        t.clients.iter().map(|c| c.name.clone()).collect();
+
     let mut bots = HashMap::new();
     for (alias, spec) in &t.bots {
-        bots.insert(alias.clone(), spec.token.resolve()?);
+        let webhook = match (
+            spec.webhook_secret.as_ref(),
+            spec.webhook_url.as_ref(),
+            spec.webhook_client.as_ref(),
+        ) {
+            (Some(secret), Some(url), Some(client)) => {
+                if !clients_names.contains(client) {
+                    bail!("bot {alias}: webhook_client {client} is not a known client");
+                }
+                Some(WebhookTarget {
+                    secret: secret.resolve()?,
+                    url: url.clone(),
+                    client: client.clone(),
+                })
+            }
+            (None, None, None) => None,
+            _ => bail!(
+                "bot {alias}: webhook_secret, webhook_url and webhook_client \
+                 must be set together"
+            ),
+        };
+        bots.insert(
+            alias.clone(),
+            Bot {
+                token: spec.token.resolve()?,
+                webhook,
+            },
+        );
     }
     let mut clients = HashMap::new();
     for spec in &t.clients {

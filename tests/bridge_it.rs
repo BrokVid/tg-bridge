@@ -15,12 +15,13 @@ use tower::ServiceExt;
 
 use tg_bridge::auth::sign_hex;
 use tg_bridge::config::{
-    Client, Config, Metrics as MetricsCfg, RateLimit, Server, Telegram,
+    Bot, Client, Config, Metrics as MetricsCfg, RateLimit, Server, Telegram, WebhookTarget,
 };
 use tg_bridge::{AppState, SharedState};
 
 const SECRET: &str = "test-secret-0123456789abcdef";
 const CLIENT: &str = "testclient";
+const WEBHOOK_SECRET: &str = "telegram-webhook-secret";
 
 fn test_config(api_base: String) -> Config {
     Config {
@@ -37,7 +38,22 @@ fn test_config(api_base: String) -> Config {
             requests_per_minute: 1000,
         },
         metrics: MetricsCfg { enabled: true },
-        bots: HashMap::from([("salut".to_string(), "123456:FAKE-TOKEN".to_string())]),
+        bots: HashMap::from([
+            (
+                "salut".to_string(),
+                Bot {
+                    token: "123456:FAKE-TOKEN".to_string(),
+                    webhook: None,
+                },
+            ),
+            (
+                "noweb".to_string(),
+                Bot {
+                    token: "789:OTHER".to_string(),
+                    webhook: None,
+                },
+            ),
+        ]),
         clients: HashMap::from([(
             CLIENT.to_string(),
             Client {
@@ -553,7 +569,13 @@ async fn unknown_bot_alias_is_404() {
 #[tokio::test]
 async fn bot_not_allowed_for_client_is_403() {
     let mut cfg = test_config("http://127.0.0.1:1".into());
-    cfg.bots.insert("other".to_string(), "token".to_string());
+    cfg.bots.insert(
+        "other".to_string(),
+        Bot {
+            token: "token".to_string(),
+            webhook: None,
+        },
+    );
     let state: SharedState = Arc::new(AppState {
         limiter: tg_bridge::ratelimit::RateLimiter::new(100),
         metrics: tg_bridge::metrics::Metrics::default(),
@@ -566,7 +588,145 @@ async fn bot_not_allowed_for_client_is_403() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-// ---------- per-client passthrough switch ----------
+// ---------- webhook relay (ADR-6) ----------
+
+type WebhookCapture = Arc<std::sync::Mutex<Option<(String, String, Vec<u8>)>>>; // ts, sig, body
+
+struct FakeClient {
+    url: String,
+    captured: WebhookCapture,
+}
+
+/// Client-side endpoint that the bridge delivers webhook updates to.
+async fn fake_client_endpoint() -> FakeClient {
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let cap = captured.clone();
+    let app = axum::Router::new().route(
+        "/tg/callback",
+        axum::routing::post(
+            |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                let get = |k: &str| {
+                    headers
+                        .get(k)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                *cap.lock().unwrap() = Some((
+                    get("x-tgb-timestamp"),
+                    get("x-tgb-signature"),
+                    body.to_vec(),
+                ));
+                axum::Json(json!({"received": true}))
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    FakeClient {
+        url: format!("http://{addr}/tg/callback"),
+        captured,
+    }
+}
+
+async fn send_webhook(
+    router: axum::Router,
+    alias: &str,
+    secret: Option<&str>,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://bridge.test/webhook/{alias}"))
+        .header("content-type", "application/json")
+        .header("x-telegram-bot-api-secret-token", secret.unwrap_or("wrong"))
+        .extension(ConnectInfo("127.0.0.1:55555".parse::<SocketAddr>().unwrap()))
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, value)
+}
+
+fn state_with_webhook(api_base: String, client_url: String) -> SharedState {
+    let mut cfg = test_config(api_base);
+    cfg.bots.get_mut("salut").unwrap().webhook = Some(WebhookTarget {
+        secret: WEBHOOK_SECRET.into(),
+        url: client_url,
+        client: CLIENT.into(),
+    });
+    Arc::new(AppState {
+        limiter: tg_bridge::ratelimit::RateLimiter::new(100),
+        metrics: tg_bridge::metrics::Metrics::default(),
+        nonces: tg_bridge::nonce::NonceCache::new(125),
+        http: reqwest::Client::new(),
+        cfg,
+    })
+}
+
+#[tokio::test]
+async fn webhook_relays_signed_update_to_client() {
+    let fc = fake_client_endpoint().await;
+    let router = tg_bridge::build_router(state_with_webhook(
+        "http://127.0.0.1:1".into(),
+        fc.url.clone(),
+    ));
+
+    let update = json!({"update_id": 42, "message": {"text": "hi"}}).to_string();
+    let (status, body) =
+        send_webhook(router, "salut", Some(WEBHOOK_SECRET), &update).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+
+    let cap = fc.captured.lock().unwrap().clone().expect("delivered");
+    assert_eq!(cap.2, update.as_bytes());
+    // delivery must be signed with the client's secret over {ts}\n{body}
+    let ts: i64 = cap.0.parse().expect("numeric ts");
+    assert_eq!(cap.1, sign_hex(SECRET.as_bytes(), ts, update.as_bytes()));
+}
+
+#[tokio::test]
+async fn webhook_bad_secret_rejected_without_delivery() {
+    let fc = fake_client_endpoint().await;
+    let router = tg_bridge::build_router(state_with_webhook(
+        "http://127.0.0.1:1".into(),
+        fc.url.clone(),
+    ));
+    let (status, _) =
+        send_webhook(router, "salut", Some("totally-wrong"), "{}").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(fc.captured.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn webhook_not_configured_is_404() {
+    let fc = fake_client_endpoint().await;
+    let router = tg_bridge::build_router(state_with_webhook(
+        "http://127.0.0.1:1".into(),
+        fc.url.clone(),
+    ));
+    let (status, _) =
+        send_webhook(router.clone(), "noweb", Some(WEBHOOK_SECRET), "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send_webhook(router, "unknown", Some(WEBHOOK_SECRET), "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn webhook_failed_delivery_returns_bad_gateway() {
+    // point the webhook at a port with nothing listening
+    let router = tg_bridge::build_router(state_with_webhook(
+        "http://127.0.0.1:1".into(),
+        "http://127.0.0.1:1/tg/callback".into(),
+    ));
+    let (status, _) =
+        send_webhook(router, "salut", Some(WEBHOOK_SECRET), "{}").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
 
 #[tokio::test]
 async fn passthrough_denied_when_disabled_for_client() {

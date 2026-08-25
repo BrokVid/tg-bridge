@@ -53,9 +53,9 @@ Drop-in client module: [examples/tgbridge_client.py](examples/tgbridge_client.py
 ## Status
 
 v0.1.0 — running in production on the author's own fleet: passthrough (JSON
-and multipart file uploads), actions, metrics, rate limiting, replay
-protection, integration tests. Roadmap to v1.0: webhook mode (Telegram ->
-bridge -> clients), TLS fronting docs.
+and multipart file uploads), actions, webhook relay, metrics, rate limiting,
+replay protection, integration tests. Roadmap to v1.0: TLS fronting docs,
+public GitHub release.
 
 ## License
 
