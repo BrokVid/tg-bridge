@@ -20,34 +20,39 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 [[ $(id -u) -eq 0 ]] || die "run as root: sudo bash install.sh"
 command -v systemctl >/dev/null || die "systemd is required"
 
-# --- prompts (work over `curl | bash` thanks to /dev/tty) -------------------
+# --- prompts ----------------------------------------------------------------
+# Every answer can be pre-set via environment variable for unattended
+# installs: TGB_LISTEN, TGB_ALIAS, TGB_BOT_TOKEN, TGB_CLIENT, TGB_CLIENT_IP,
+# TGB_USE_RELEASE.
 ask() { # ask <prompt> <default> -> answer in $REPLY
     local prompt="$1" def="${2:-}"
     local in="/dev/tty"; [ -r "$in" ] || in=""
     if [ -n "$in" ]; then
         read -r -p "$(printf '\033[1m%s\033[0m%s: ' "$prompt" "${def:+ [$def]}")" REPLY <"$in" || die "aborted"
+        REPLY="${REPLY:-$def}"
     else
-        REPLY="$def"; return 0
+        # non-interactive (curl | bash): fall back to the provided default,
+        # which may come from the environment
+        REPLY="$def"
     fi
-    REPLY="${REPLY:-$def}"
 }
 
 secret() { openssl rand -hex 32; }
 
 # --- questions --------------------------------------------------------------
 log "Tg Bridge setup"
-ask "Listen address (127.0.0.1 behind TLS/reverse proxy, 0.0.0.0 for direct)" "127.0.0.1:8080"
+ask "Listen address (127.0.0.1 behind TLS/reverse proxy, 0.0.0.0 for direct)" "${TGB_LISTEN:-127.0.0.1:8080}"
 LISTEN="$REPLY"
-ask "Bot alias (clients use it in URLs, e.g. mybot)" "mybot"
+ask "Bot alias (clients use it in URLs, e.g. mybot)" "${TGB_ALIAS:-mybot}"
 ALIAS="$REPLY"
-ask "Telegram bot token from @BotFather" ""
+ask "Telegram bot token from @BotFather" "${TGB_BOT_TOKEN:-}"
 BOT_TOKEN="$REPLY"
-[ -n "$BOT_TOKEN" ] || die "bot token is required"
-ask "First client name (e.g. myapp)" "myapp"
+[ -n "$BOT_TOKEN" ] || die "bot token is required (set TGB_BOT_TOKEN for unattended installs)"
+ask "First client name (e.g. myapp)" "${TGB_CLIENT:-myapp}"
 CLIENT="$REPLY"
-ask "Restrict client to an IP/CIDR? (empty = any IP)" ""
+ask "Restrict client to an IP/CIDR? (empty = any IP)" "${TGB_CLIENT_IP:-}"
 ALLOWED="$REPLY"
-ask "Download prebuilt binary from GitHub Releases? (no = build with cargo)" "yes"
+ask "Download prebuilt binary from GitHub Releases? (no = build with cargo)" "${TGB_USE_RELEASE:-yes}"
 USE_RELEASE="$REPLY"
 
 # --- files & user -----------------------------------------------------------
