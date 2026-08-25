@@ -26,13 +26,16 @@ command -v systemctl >/dev/null || die "systemd is required"
 # TGB_USE_RELEASE.
 ask() { # ask <prompt> <default> -> answer in $REPLY
     local prompt="$1" def="${2:-}"
-    local in="/dev/tty"; [ -r "$in" ] || in=""
-    if [ -n "$in" ]; then
-        read -r -p "$(printf '\033[1m%s\033[0m%s: ' "$prompt" "${def:+ [$def]}")" REPLY <"$in" || die "aborted"
+    # opening /dev/tty fails when there is no controlling terminal
+    # (e.g. `curl | bash` over ssh), which means unattended mode
+    if exec 3</dev/tty 2>/dev/null; then
+        read -r -p "$(printf '\033[1m%s\033[0m%s: ' "$prompt" "${def:+ [$def]}")" REPLY <&3 || {
+            exec 3<&-; die "aborted";
+        }
+        exec 3<&-
         REPLY="${REPLY:-$def}"
     else
-        # non-interactive (curl | bash): fall back to the provided default,
-        # which may come from the environment
+        # fall back to the provided default, which may come from the environment
         REPLY="$def"
     fi
 }
