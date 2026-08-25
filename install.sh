@@ -28,7 +28,9 @@ ask() { # ask <prompt> <default> -> answer in $REPLY
     local prompt="$1" def="${2:-}"
     # opening /dev/tty fails when there is no controlling terminal
     # (e.g. `curl | bash` over ssh), which means unattended mode
-    if exec 3</dev/tty 2>/dev/null; then
+    local have_tty=0
+    { exec 3</dev/tty; } 2>/dev/null && have_tty=1
+    if [ "$have_tty" -eq 1 ]; then
         read -r -p "$(printf '\033[1m%s\033[0m%s: ' "$prompt" "${def:+ [$def]}")" REPLY <&3 || {
             exec 3<&-; die "aborted";
         }
@@ -57,6 +59,14 @@ ask "Restrict client to an IP/CIDR? (empty = any IP)" "${TGB_CLIENT_IP:-}"
 ALLOWED="$REPLY"
 ask "Download prebuilt binary from GitHub Releases? (no = build with cargo)" "${TGB_USE_RELEASE:-yes}"
 USE_RELEASE="$REPLY"
+
+# fail fast if the port is already taken, before touching the system
+LISTEN_HOST="${LISTEN%%:*}"
+LISTEN_PORT="${LISTEN##*:}"
+if (exec 3<>"/dev/tcp/${LISTEN_HOST}/${LISTEN_PORT}") 2>/dev/null; then
+    exec 3>&- 3<&-
+    die "port ${LISTEN_PORT} on ${LISTEN_HOST} is already in use; choose another TGB_LISTEN"
+fi
 
 # --- files & user -----------------------------------------------------------
 log "creating user and directories"
