@@ -78,7 +78,7 @@ REST+HMAC: вызывается из `curl`, Python `requests` за 10 стро�
 |---|---|
 | `server` | axum-роутер: `/healthz`, `/metrics`, `/v1/t/:alias/:method`, `/v1/a/:name` |
 | `auth` | проверка HMAC-подписи, timestamp-окна, IP allowlist |
-| `proxy` | пул соединений к api.telegram.org, таймауты, ретраи read-only методов |
+| `proxy` | пул соединений к api.telegram.org, таймауты. Без авторетраев: повторяет клиент (см. PROTOCOL.md «Идемпотентность и повторы») |
 | `actions` | рендер шаблонов действий из конфига |
 | `config` | TOML + env-интерполяция (`env:VAR`, `file:/path`) |
 | `limits` | per-client rate limit, лимит тела запроса |
